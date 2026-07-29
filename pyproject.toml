@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tdgl_lsfd"
+version = "0.1.0"
+description = "TDGL solver using Least Squares Finite Difference (LSFD) method"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "h5py>=3.0",
+    "matplotlib>=3.5",
+    "MeshPy>=2022.1",
+    "numba>=0.55",
+    "numpy>=1.24",
+    "opt_einsum>=3.3",
+    "scipy>=1.7",
+    "Shapely>=2.0",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tdgl_LSFD_lib*"]
