@@ -1,42 +1,66 @@
 """
-runner.py — Цикл симуляции, сохранение в HDF5 и мониторинг.
+runner.py — Simulation loop, HDF5 persistence, and monitoring.
+
+Architecture:
+    - TDGLRunner orchestrates the simulation loop.
+    - Solver computes spatial fields (psi, mu, currents) at each step.
+    - Trackers extract scalar observables and store them in fixed-size buffers.
+    - Runner stores time/step/dt/poisson_tolerance in its own buffer.
+    - Every `save_every` steps (and at the end), Runner flushes:
+        * its own buffer (time, step, dt, poisson_tolerance) to HDF5
+        * each tracker's buffer to HDF5
+        * the current spatial fields (psi, mu, currents) to HDF5
+
+HDF5 layout:
+    output.h5
+    ├── mesh/                    — mesh geometry (once)
+    ├── A_for_constant_Bz        — fixed field (once)
+    ├── data/                    — spatial snapshots every save_every steps
+    │   ├── 0/
+    │   │   ├── psi, mu, supercurrent_x, ...
+    │   │   └── attrs: step, time, dt
+    │   └── 1/
+    └── time_series/             — scalar time series (every step)
+        ├── time, step, dt, poisson_tolerance   (from Runner)
+        ├── energy_voronoi, flux_edges, ...     (from ConservationTracker)
+        ├── mu_probe, phase_probe               (from PhysicalTracker)
+        ├── probe_points_coords, probe_points_indices  (from PhysicalTracker)
 """
 import itertools
 import logging
-import numbers
 import os
-import subprocess
-import sys
 import tempfile
 import time
 import traceback
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
 from tqdm import TqdmWarning, tqdm
 
 from .solver import TDGLSolver, StepResult
-from .dynamics_options import SolverOptions, TimeScheme
-from ..operators.fvm_integrator import FVMIntegrator
+from .dynamics_options import SolverOptions
+from ..trackers.base_tracker import SimulationTracker
+from ..trackers.conservation_tracker import ConservationTracker
+from ..trackers.physical_tracker import PhysicalTracker
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# DATA HANDLER — УПРАВЛЕНИЕ HDF5 ФАЙЛАМИ
+# DATA HANDLER — HDF5 FILE MANAGEMENT
 # ============================================================================
 
 class DataHandler:
     """
-    Контекстный менеджер для чтения/записи в HDF5.
+    Context manager for reading/writing HDF5 files.
 
-    Создаёт два файла:
-    - output.h5 — основные данные (сохраняются каждые save_every шагов)
-    - output.h5.tmp — временный файл для мониторинга (последний шаг)
+    Creates two files:
+        - output.h5     — main data (snapshots every save_every steps)
+        - output.h5.tmp — temporary file for live monitoring (last step only)
     """
 
     def __init__(
@@ -47,6 +71,7 @@ class DataHandler:
         self.tempdir = None
         self.mesh_group = None
         self.time_step_group = None
+        self.time_series_group = None
         self.save_number = 0
         self.logger = logger if logger is not None else logging.getLogger()
         self._base_output_file = output_file
@@ -57,7 +82,7 @@ class DataHandler:
         self.tmp_path: Optional[str] = None
 
     def _create_output_file(self, output: str) -> Tuple[h5py.File, str, h5py.File, str]:
-        """Создаёт выходной файл и временный файл для мониторинга."""
+        """Create the output file and the temporary monitoring file."""
         if output is None:
             self.tempdir = tempfile.TemporaryDirectory()
             directory = self.tempdir.name
@@ -82,14 +107,13 @@ class DataHandler:
                 file = h5py.File(file_path, "x")
                 tmp_file = h5py.File(tmp_file_path, "x", libver="latest")
             except (OSError, FileExistsError):
-                if serial_number is None:
-                    serial_number = 1
-                else:
-                    serial_number += 1
+                serial_number = 1 if serial_number is None else serial_number + 1
                 continue
             else:
                 if serial_number is not None:
-                    self.logger.warning(f"Output file already exists. Renaming to {file_name}.")
+                    self.logger.warning(
+                        f"Output file already exists. Renaming to {file_name}."
+                    )
                 return file, file_path, tmp_file, tmp_file_path
 
     def __enter__(self) -> "DataHandler":
@@ -101,8 +125,9 @@ class DataHandler:
         ) = self._create_output_file(self._base_output_file)
 
         self.time_step_group = self.output_file.create_group("data", track_order=True)
+        self.time_series_group = self.output_file.create_group("time_series")
 
-        # Инициализация временного файла для мониторинга
+        # Initialize the temporary file for live monitoring
         grp = self.tmp_file.create_group("data/-1")
         grp["step"] = np.array([0])
         grp["time"] = np.array([0.0])
@@ -116,8 +141,8 @@ class DataHandler:
             self.logger.warning(" ".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
         self.close()
 
-    def close(self):
-        """Закрывает файлы и очищает временные данные."""
+    def close(self) -> None:
+        """Close files and clean up temporary data."""
         self.output_file.close()
         if self.tmp_file is not None:
             self.tmp_file.flush()
@@ -127,12 +152,12 @@ class DataHandler:
             self.tempdir.cleanup()
 
     def save_mesh(self, mesh) -> None:
-        """Сохраняет сетку в output_file['mesh']."""
+        """Save the mesh geometry once."""
         self.mesh_group = self.output_file.create_group("mesh")
         mesh.to_hdf5(self.mesh_group)
 
     def save_fixed_values(self, fixed_data: Dict[str, np.ndarray]) -> None:
-        """Сохраняет фиксированные значения (не меняются со временем)."""
+        """Save fixed values (do not change over time)."""
         for key, value in fixed_data.items():
             if not isinstance(value, np.ndarray):
                 value = np.asarray(value)
@@ -143,210 +168,193 @@ class DataHandler:
         self,
         state: Dict[str, Any],
         data: Dict[str, np.ndarray],
-        running_state: Optional[Dict[str, np.ndarray]] = None,
     ) -> None:
-        """Сохраняет состояние и данные на каждом шаге."""
+        """Save a spatial snapshot (every save_every steps)."""
         group = self.time_step_group.create_group(f"{self.save_number}")
         group.attrs["timestamp"] = datetime.now().isoformat()
         self.save_number += 1
 
         tmp_grp = self.tmp_file["data/-1"]
 
-        # Сохранение атрибутов состояния
+        # State attributes
         for key, value in state.items():
             group.attrs[key] = value
 
-        # Сохранение полей данных
+        # Field data
         for key, value in data.items():
             if not isinstance(value, np.ndarray):
                 value = np.asarray(value)
             group[key] = value
 
-            # Обновление временного файла для мониторинга
+            # Update the temporary monitoring file
             if key in tmp_grp:
                 tmp_grp[key][:] = value
             else:
                 tmp_grp[key] = value
             tmp_grp[key].flush()
 
-        # Обновление базовых атрибутов
+        # Update base attributes in the temporary file
         for key in ("step", "time", "dt"):
             tmp_grp[key][:] = np.array([state[key]])
             tmp_grp[key].flush()
 
-        # Сохранение running_state (скаляры на каждом шаге)
-        if running_state is not None:
-            running_grp = group.create_group("running_state")
-            for key, value in running_state.items():
-                if not isinstance(value, np.ndarray):
-                    value = np.asarray(value)
-                running_grp[key] = np.squeeze(value)
-
 
 # ============================================================================
-# RUNNING STATE — БУФЕРИЗАЦИЯ СКАЛЯРОВ
-# ============================================================================
-
-class RunningState:
-    """
-    Хранилище для скалярных данных, сохраняемых на каждом шаге.
-
-    Args:
-        names_and_sizes: Dict {name: size} — имена и размеры параметров
-        buffer_size: Размер буфера перед записью на диск
-    """
-
-    def __init__(
-        self,
-        names_and_sizes: Dict[str, int],
-        buffer_size: int,
-        array_module=np,
-    ):
-        self.step = 0
-        self.array_module = array_module
-        self.buffer_size = buffer_size
-        self.names_and_sizes = names_and_sizes
-        self.values = {
-            name: array_module.zeros((size, buffer_size))
-            for name, size in self.names_and_sizes.items()
-        }
-
-    def clear(self) -> None:
-        """Очищает буфер."""
-        self.step = 0
-        for name, size in self.names_and_sizes.items():
-            self.values[name] = self.array_module.zeros((size, self.buffer_size))
-
-    def append(self, name: str, value: Sequence[float]) -> None:
-        """Добавляет данные в буфер."""
-        self.values[name][:, self.step] = value
-
-
-# ============================================================================
-# TDGL RUNNER — ОСНОВНОЙ КЛАСС
+# TDGL RUNNER — MAIN CLASS
 # ============================================================================
 
 class TDGLRunner:
     """
-    Запускает TDGL симуляцию с учётом термализации, сохранения и адаптивного шага.
+    Runs a TDGL simulation with thermalization, field saving, and adaptive stepping.
+
+    Trackers are created automatically based on SolverOptions flags:
+        - track_conservation=True  → ConservationTracker
+        - track_physical=True      → PhysicalTracker (requires device.probe_points)
+        - track_vortices=True      → VortexTracker (future)
 
     Args:
-        solver: Экземпляр TDGLSolver
-        options: Параметры симуляции
+        solver: TDGLSolver instance.
+        options: SolverOptions with simulation parameters.
     """
 
-    def __init__(self, solver: TDGLSolver, options: SolverOptions):
+    def __init__(
+        self,
+        solver: TDGLSolver,
+        options: SolverOptions,
+    ):
         self.solver = solver
         self.options = options
 
-        # Состояние симуляции
+        # Simulation state
         self.t = 0.0
         self.dt = options.dt_init
         self.step = 0
 
-        # FVM integrator для проверок
-        if options.check_conservation or options.check_energy:
-            self.fvm = FVMIntegrator(mesh=solver.device.mesh)
-        else:
-            self.fvm = None
+        # === CREATE TRACKERS based on options flags ===
+        self.trackers: List[SimulationTracker] = self._create_trackers()
 
-        # === RUNNING STATE для скаляров ===
-        running_names_and_sizes = {"dt": 1}
+        # === RUNNER'S OWN BUFFER for time/step/dt/poisson_tolerance ===
+        # These are shared across all trackers, so Runner stores them once.
+        buffer_size = options.save_every
+        self._time_buf = np.zeros(buffer_size, dtype=np.float64)
+        self._step_buf = np.zeros(buffer_size, dtype=np.int64)
+        self._dt_buf = np.zeros(buffer_size, dtype=np.float64)
+        self._poisson_tol_buf = np.zeros(buffer_size, dtype=np.float64)
+        self._buf_idx = 0
 
-        if solver.device.probe_points is not None:
-            running_names_and_sizes["mu_probe"] = len(solver.device.probe_points)
-            running_names_and_sizes["theta_probe"] = len(solver.device.probe_points)
+        # HDF5 datasets created flag (for Runner's own time series)
+        self._runner_datasets_created = False
 
-        if options.check_energy:
-            running_names_and_sizes["energy_voronoi"] = 1
-            running_names_and_sizes["energy_triangles"] = 1
+    def _create_trackers(self) -> List[SimulationTracker]:
+        """
+        Create trackers based on SolverOptions flags.
 
-        if options.check_conservation:
-            running_names_and_sizes["global_surface_flux_edges"] = 1
-            running_names_and_sizes["global_surface_flux_sites"] = 1
-            running_names_and_sizes["global_div_voronoi"] = 1
-            running_names_and_sizes["global_div_triangles"] = 1
+        Returns:
+            List of SimulationTracker instances.
 
-        if options.check_residual:
-            running_names_and_sizes["poisson_residual_max"] = 1
-            running_names_and_sizes["poisson_residual_mean"] = 1
+        Raises:
+            ValueError: If track_physical=True but device.probe_points is not set.
+        """
+        trackers: List[SimulationTracker] = []
+        buffer_size = self.options.save_every
 
-        self.running_state = RunningState(
-            running_names_and_sizes,
-            buffer_size=options.save_every,
+        # 1. ConservationTracker
+        if self.options.track_conservation:
+            trackers.append(ConservationTracker(
+                mesh=self.solver.device.mesh,
+                buffer_size=buffer_size,
+                log_every=self.options.tracker_log_every,
+            ))
+
+        # 2. PhysicalTracker — requires probe_points
+        if self.options.track_physical:
+            # PhysicalTracker.__init__ will raise ValueError if probe_points is None
+            trackers.append(PhysicalTracker(
+                device=self.solver.device,
+                buffer_size=buffer_size,
+            ))
+
+        # 3. VortexTracker (future)
+        # if self.options.track_vortices:
+        #     from ..trackers.vortex_tracker import VortexTracker
+        #     trackers.append(VortexTracker(
+        #         mesh=self.solver.device.mesh,
+        #         max_vortices=self.options.max_vortices,
+        #         buffer_size=buffer_size,
+        #     ))
+
+        logger.info(
+            f"Created {len(trackers)} tracker(s): "
+            f"{[type(t).__name__ for t in trackers]}"
         )
 
+        return trackers
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def run(
-            self,
-            psi_init: Optional[np.ndarray] = None,
-            mu_init: Optional[np.ndarray] = None,
-            seed_solution: Optional[str] = None,
-    ) -> Dict[str, Union[np.ndarray, List]]:
-        """Запустить полную симуляцию."""
+        self,
+        psi_init: Optional[np.ndarray] = None,
+        mu_init: Optional[np.ndarray] = None,
+        seed_solution: Optional[str] = None,
+    ) -> Dict[str, Union[str, int, float, bool]]:
+        """Run the full simulation (thermalization + main stage)."""
         start_time = time.perf_counter()
 
-        # Загрузка начальных условий
+        # Load initial conditions
         if seed_solution is not None:
             psi, mu = self._load_seed_solution(seed_solution)
         else:
-            psi = psi_init if psi_init is not None else np.ones(self.solver.n_sites, dtype=np.complex128)
-            mu = mu_init if mu_init is not None else np.zeros(self.solver.n_sites, dtype=np.float64)
+            psi = psi_init if psi_init is not None else np.ones(
+                self.solver.n_sites, dtype=np.complex128
+            )
+            mu = mu_init if mu_init is not None else np.zeros(
+                self.solver.n_sites, dtype=np.float64
+            )
 
-        # === ЗАПУСК С DATAHANDLER ===
         with DataHandler(output_file=self.options.output_file, logger=logger) as data_handler:
-            # Сохранение сетки
+            # Save mesh and fixed values once
             data_handler.save_mesh(self.solver.device.mesh)
-
-            # Сохранение фиксированных значений
-            fixed_data = {
+            data_handler.save_fixed_values({
                 "A_for_constant_Bz": self.solver.A_for_constant_Bz,
-            }
-            data_handler.save_fixed_values(fixed_data)
+            })
 
-            # === 1. ТЕРМАЛИЗАЦИЯ ===
+            # === 1. THERMALIZATION ===
             if self.options.skip_time > 0:
-                logger.info(f"Термализация: t ∈ [0, {self.options.skip_time}]")
+                logger.info(f"Thermalization: t in [0, {self.options.skip_time}]")
                 success = self._run_stage(
-                    psi=psi,
-                    mu=mu,
+                    psi=psi, mu=mu,
                     end_time=self.options.skip_time,
                     save=False,
-                    desc="Термализация",
+                    desc="Thermalization",
                     data_handler=data_handler,
                 )
-
                 if not success:
-                    logger.warning("Термализация отменена пользователем")
+                    logger.warning("Thermalization cancelled by user")
                     return {"output_path": data_handler.output_path, "cancelled": True}
 
-                # Сброс истории после термализации
-                self.running_state.clear()
+                # Reset state after thermalization
+                self._reset_buffers()
                 self.t = 0.0
                 self.step = 0
 
-            # === 2. ОСНОВНАЯ СИМУЛЯЦИЯ ===
-            logger.info(f"Симуляция: t ∈ [0, {self.options.solve_time}]")
+            # === 2. MAIN SIMULATION ===
+            logger.info(f"Simulation: t in [0, {self.options.solve_time}]")
             success = self._run_stage(
-                psi=psi,
-                mu=mu,
+                psi=psi, mu=mu,
                 end_time=self.options.solve_time,
                 save=True,
-                desc="Симуляция",
+                desc="Simulation",
                 data_handler=data_handler,
             )
 
-            elapsed = time.perf_counter() - start_time
+            # Final flush of any remaining buffered time-series data
+            self._flush_time_series(data_handler.time_series_group)
 
-            # === ФИНАЛЬНАЯ СТАТИСТИКА ===
-            print("\n" + "=" * 60)
-            print("СИМУЛЯЦИЯ ЗАВЕРШЕНА")
-            print("=" * 60)
-            print(f"Общее время: {elapsed:.2f} с")
-            print(f"Всего шагов: {self.step}")
-            print(f"Среднее время на шаг: {elapsed / self.step * 1000:.2f} мс")
-            print(f"Средняя скорость: {self.step / elapsed:.2f} шагов/с")
-            print(f"Статус: {'✅ Успешно' if success else '❌ Отменено'}")
-            print("=" * 60)
+            elapsed = time.perf_counter() - start_time
+            self._log_final_statistics(elapsed, success)
 
             return {
                 "output_path": data_handler.output_path,
@@ -355,22 +363,10 @@ class TDGLRunner:
                 "cancelled": not success,
             }
 
-    def _load_seed_solution(self, seed_path: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Загружает начальные условия из HDF5 файла."""
-        logger.info(f"Загрузка начальных условий из {seed_path}")
-        with h5py.File(seed_path, "r") as f:
-            # Находим последний шаг
-            data_group = f["data"]
-            steps = [int(key) for key in data_group.keys()]
-            last_step = str(max(steps))
+    # ------------------------------------------------------------------
+    # Internal: simulation loop
+    # ------------------------------------------------------------------
 
-            psi = np.array(data_group[last_step]["psi"])
-            mu = np.array(data_group[last_step]["mu"])
-
-        logger.info(f"Загружено: psi shape={psi.shape}, mu shape={mu.shape}")
-        return psi, mu
-
-    # runner.py
     def _run_stage(
             self,
             psi: np.ndarray,
@@ -380,19 +376,14 @@ class TDGLRunner:
             desc: str,
             data_handler: DataHandler,
     ) -> bool:
-        """Запустить один этап симуляции."""
+        """Run one simulation stage (thermalization or main)."""
         psi_abs_sq = np.abs(psi) ** 2
 
-        # === НАСТРОЙКА ПРОГРЕСС-БАРА ===
-        prog_disabled = (
-                self.options.progress_interval is not None
-                and self.options.progress_interval > 0
-        )
+        # Progress bar setup
         bar_format = "{l_bar}{bar}| {n:.2f}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt} {postfix}]"
-
         cancelled = False
         save_counter = 0
-        now = None
+        last_result: Optional[StepResult] = None
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=TqdmWarning)
@@ -400,171 +391,196 @@ class TDGLRunner:
                     initial=self.t,
                     total=end_time,
                     desc=desc,
-                    disable=prog_disabled,
+                    disable=not self.options.use_tqdm,
                     unit="τ₀",
                     bar_format=bar_format,
                     dynamic_ncols=True,
             ) as pbar:
 
-                for i in itertools.count():
+                for _ in itertools.count():
                     try:
                         iter_start = time.perf_counter()
 
-                        # === ОДИН ШАГ СИМУЛЯЦИИ ===
+                        # === ONE SOLVER STEP ===
                         result: StepResult = self.solver.solve_for_one_step(
                             psi=psi,
                             psi_abs_sq=psi_abs_sq,
                             mu=mu,
                             t=self.t,
-                            dt=self.dt,  # ← Передаём текущий dt
+                            dt=self.dt,
                         )
 
-                        # Распаковка результата
+                        # Unpack result
                         psi = result.psi
                         psi_abs_sq = result.psi_abs_sq
-                        supercurrent_x = result.supercurrent_x
-                        supercurrent_y = result.supercurrent_y
-                        div_Js = result.div_Js
                         mu = result.mu
-                        normal_current = result.normal_current
+                        self.dt = result.dt  # adaptive step
 
-                        # === ВАЖНО: Обновляем dt из результата! ===
-                        self.dt = result.dt
+                        iter_time = time.perf_counter() - iter_start
 
-                        iter_end = time.perf_counter()
-                        iter_time = iter_end - iter_start
-
-                        # Обновление времени и шага
+                        # Update time and step counter
                         self.t += self.dt
                         self.step += 1
                         save_counter += 1
+                        last_result = result
 
-                        # Обновление прогресс-бара
-                        if self.t < end_time:
-                            pbar.update(self.dt)
-                        else:
-                            pbar.update(end_time - (self.t - self.dt))
-
+                        # Update progress bar
+                        pbar.update(self.dt)
                         pbar.set_postfix({
                             'dt': f'{self.dt:.2e}',
+                            'tol': f'{result.poisson_tolerance:.2e}',
                             'iter': f'{iter_time * 1000:.1f}ms',
                         })
 
-                        # === СОХРАНЕНИЕ СКАЛЯРОВ ===
-                        self._update_running_state(
-                            psi=psi, mu=mu,
-                            supercurrent_x=supercurrent_x,
-                            supercurrent_y=supercurrent_y,
-                            div_Js=div_Js,
-                            result=result,
-                        )
-
-                        # === СОХРАНЕНИЕ ПОЛЕЙ ===
-                        if save and (save_counter % self.options.save_every == 0):
-                            state = {
-                                "step": self.step,
-                                "time": self.t,
-                                "dt": self.dt,
-                            }
-                            data = {
-                                "psi": psi,
-                                "mu": mu,
-                                "supercurrent_x": supercurrent_x,
-                                "supercurrent_y": supercurrent_y,
-                                "div_Js": div_Js,
-                                "normal_current": normal_current,
-                            }
-                            running_state = self.running_state.values if self.running_state.step > 0 else None
-                            data_handler.save_time_step(state, data, running_state)
-                            self.running_state.clear()
-
-                        # Ручной прогресс
-                        if prog_disabled and (i % self.options.progress_interval == 0):
-                            then, now = now, time.perf_counter()
-                            speed = self.options.progress_interval / (now - then) if then else 0
-                            logger.info(
-                                f"{desc}: Time {self.t:.2f}/{end_time:.2f}, "
-                                f"dt={self.dt:.2e}, {speed:.2f} it/s"
+                        # === UPDATE TRACKERS ===
+                        for tracker in self.trackers:
+                            tracker.on_step(
+                                step=self.step, t=self.t, dt=self.dt,
+                                result=result, solver=self.solver,
                             )
 
-                        # Проверка окончания
+                        # === UPDATE RUNNER'S BUFFER ===
+                        self._time_buf[self._buf_idx] = self.t
+                        self._step_buf[self._buf_idx] = self.step
+                        self._dt_buf[self._buf_idx] = self.dt
+                        self._poisson_tol_buf[self._buf_idx] = result.poisson_tolerance
+                        self._buf_idx += 1
+
+                        # === SAVE EVERY save_every STEPS ===
+                        if save and (save_counter % self.options.save_every == 0):
+                            self._save_snapshot(data_handler, psi, mu, result)
+                            self._flush_time_series(data_handler.time_series_group)
+
+                        # Check end of stage
                         if self.t >= end_time:
                             break
 
                     except KeyboardInterrupt:
-                        msg = f"{{}} simulation at step {self.step} of stage {desc!r}."
-                        if self.options.pause_on_interrupt:
+                        if self.options.use_pause:
                             response = input(
                                 f"\nSimulation paused at stage {desc!r} (step {self.step}). "
-                                "Continue simulation? [yN] "
+                                "Continue? [yN] "
                             )
-                            resume = response.lower().startswith('y')
-                            if resume:
-                                logger.info(msg.format("Resuming"))
+                            if response.lower().startswith('y'):
+                                logger.info("Resuming simulation")
+                                continue
                             else:
-                                logger.warning(msg.format("Cancelling"))
+                                logger.warning("Cancelling simulation")
                                 cancelled = True
                                 break
                         else:
-                            logger.warning(msg.format("Cancelling"))
+                            logger.warning("Cancelling simulation")
                             cancelled = True
                             break
 
-        # Сохранить последний шаг
-        if save and (save_counter % self.options.save_every):
-            state = {"step": self.step, "time": self.t, "dt": self.dt}
-            data = {
-                "psi": psi, "mu": mu,
-                "supercurrent_x": supercurrent_x,
-                "supercurrent_y": supercurrent_y,
-                "div_Js": div_Js,
-                "normal_current": normal_current,
-            }
-            running_state = self.running_state.values if self.running_state.step > 0 else None
-            data_handler.save_time_step(state, data, running_state)
-            self.running_state.clear()
+        # Save the last step if it wasn't saved in the loop
+        if save and last_result is not None and (save_counter % self.options.save_every != 0):
+            self._save_snapshot(data_handler, psi, mu, last_result)
 
         return not cancelled
 
-    def _update_running_state(
+    # ------------------------------------------------------------------
+    # Internal: HDF5 saving and flushing
+    # ------------------------------------------------------------------
+
+    def _save_snapshot(
         self,
+        data_handler: DataHandler,
         psi: np.ndarray,
         mu: np.ndarray,
-        supercurrent_x: np.ndarray,
-        supercurrent_y: np.ndarray,
-        div_Js: np.ndarray,
         result: StepResult,
     ) -> None:
-        """Обновляет running_state скалярами."""
-        # Базовые скаляры
-        self.running_state.append("dt", [self.dt])
+        """Save a spatial snapshot (fields) to HDF5."""
+        state = {"step": self.step, "time": self.t, "dt": self.dt}
+        data = {
+            "psi": psi,
+            "mu": mu,
+            "supercurrent_x": result.supercurrent_x,
+            "supercurrent_y": result.supercurrent_y,
+            "div_Js": result.div_Js,
+            "normal_current": result.normal_current,
+        }
+        data_handler.save_time_step(state, data)
 
-        # Probe points
-        if self.solver.device.probe_points is not None:
-            probe_indices = [
-                self.solver.device.closest_site(xy)
-                for xy in self.solver.device.probe_points
-            ]
-            self.running_state.append("mu_probe", mu[probe_indices])
-            self.running_state.append("theta_probe", np.angle(psi[probe_indices]))
+    def _flush_time_series(self, time_series_group) -> None:
+        """Flush Runner's buffer + all trackers' buffers to HDF5.
 
-        # Энергия
-        if self.options.check_energy and result.energy_voronoi is not None:
-            self.running_state.append("energy_voronoi", [result.energy_voronoi])
-            self.running_state.append("energy_triangles", [result.energy_triangles])
+        This is called every save_every steps and at the end of simulation
+        to save buffered time-series data.
+        """
+        if self._buf_idx == 0 and all(t._idx == 0 for t in self.trackers):
+            return  # Nothing to flush
 
-        # Глобальная проверка сохранения
-        if self.options.check_conservation and result.conservation_global is not None:
-            (surface_flux_edges, surface_flux_sites, div_voronoi, div_triangles) = result.conservation_global
+        n = self._buf_idx
 
-            self.running_state.append("global_surface_flux_edges", [surface_flux_edges])
-            self.running_state.append("global_surface_flux_sites", [surface_flux_sites])
-            self.running_state.append("global_div_voronoi", [div_voronoi])
-            self.running_state.append("global_div_triangles", [div_triangles])
+        # 1. Flush Runner's own time series
+        if n > 0:
+            self._ensure_runner_datasets(time_series_group)
+            current_size = time_series_group["time"].shape[0]
+            new_size = current_size + n
 
-        # Невязка Пуассона
-        if self.options.check_residual and result.poisson_residual is not None:
-            self.running_state.append("poisson_residual_max", [np.max(np.abs(result.poisson_residual))])
-            self.running_state.append("poisson_residual_mean", [np.mean(np.abs(result.poisson_residual))])
+            time_series_group["time"].resize(new_size, axis=0)
+            time_series_group["time"][current_size:new_size] = self._time_buf[:n]
 
-        self.running_state.step += 1
+            time_series_group["step"].resize(new_size, axis=0)
+            time_series_group["step"][current_size:new_size] = self._step_buf[:n]
+
+            time_series_group["dt"].resize(new_size, axis=0)
+            time_series_group["dt"][current_size:new_size] = self._dt_buf[:n]
+
+            time_series_group["poisson_tolerance"].resize(new_size, axis=0)
+            time_series_group["poisson_tolerance"][current_size:new_size] = self._poisson_tol_buf[:n]
+
+            self._buf_idx = 0
+
+        # 2. Flush all trackers
+        for tracker in self.trackers:
+            tracker.flush_to_hdf5(time_series_group)
+
+    def _ensure_runner_datasets(self, time_series_group) -> None:
+        """Create Runner's HDF5 datasets on first flush."""
+        if self._runner_datasets_created:
+            return
+
+        time_series_group.create_dataset("time", (0,), maxshape=(None,), dtype='f8')
+        time_series_group.create_dataset("step", (0,), maxshape=(None,), dtype='i8')
+        time_series_group.create_dataset("dt", (0,), maxshape=(None,), dtype='f8')
+        time_series_group.create_dataset("poisson_tolerance", (0,), maxshape=(None,), dtype='f8')
+
+        self._runner_datasets_created = True
+
+    # ------------------------------------------------------------------
+    # Internal: helpers
+    # ------------------------------------------------------------------
+
+    def _reset_buffers(self) -> None:
+        """Reset Runner's buffer (e.g., after thermalization)."""
+        self._buf_idx = 0
+        # Note: tracker buffers are not reset here — they keep their data.
+        # If you want to discard thermalization data, create trackers fresh
+        # or call tracker._idx = 0 manually.
+
+    def _load_seed_solution(self, seed_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Load initial conditions from an HDF5 file."""
+        logger.info(f"Loading initial conditions from {seed_path}")
+        with h5py.File(seed_path, "r") as f:
+            data_group = f["data"]
+            steps = [int(key) for key in data_group.keys()]
+            last_step = str(max(steps))
+            psi = np.array(data_group[last_step]["psi"])
+            mu = np.array(data_group[last_step]["mu"])
+        logger.info(f"Loaded: psi shape={psi.shape}, mu shape={mu.shape}")
+        return psi, mu
+
+    def _log_final_statistics(self, elapsed: float, success: bool) -> None:
+        """Log final simulation statistics."""
+        logger.info("=" * 60)
+        logger.info("SIMULATION COMPLETED")
+        logger.info("=" * 60)
+        logger.info(f"Total time: {elapsed:.2f} s")
+        logger.info(f"Total steps: {self.step}")
+        if self.step > 0:
+            logger.info(f"Avg time per step: {elapsed / self.step * 1000:.2f} ms")
+            logger.info(f"Avg speed: {self.step / elapsed:.2f} steps/s")
+        logger.info(f"Status: {'SUCCESS' if success else 'CANCELLED'}")
+        logger.info("=" * 60)

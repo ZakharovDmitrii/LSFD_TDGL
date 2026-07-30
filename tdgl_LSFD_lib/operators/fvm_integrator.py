@@ -307,7 +307,7 @@ class FVMIntegrator:
     # 5. CHECK CONSERVATION
     # ========================================================================
 
-    def global_conservation_check(self, J_x: np.ndarray, J_y: np.ndarray, div_J: np.ndarray) -> Tuple[float, float, float, float]:
+    def global_conservation_check(self, J_x: np.ndarray, J_y: np.ndarray, div_J: np.ndarray) -> Tuple[float, float, float, float, float, float]:
 
         # 1. Поток через границу edges
         surface_flux_edges = self.compute_surface_flux_edges(J_x, J_y)
@@ -321,7 +321,7 @@ class FVMIntegrator:
         # 4. Интеграл от дивергенции по всей области (треугольники)
         div_triangles  = self.compute_divergence_integral(div_J, method='triangles')
 
-        return surface_flux_edges, surface_flux_sites, div_voronoi, div_triangles
+        return surface_flux_edges, surface_flux_sites, div_voronoi, div_triangles, Jn_mean, Jn_max
 
     def local_conservation_check(self, J_x: np.ndarray, J_y: np.ndarray, div_J: np.ndarray) -> Tuple[float, float, float, float]:
         """
