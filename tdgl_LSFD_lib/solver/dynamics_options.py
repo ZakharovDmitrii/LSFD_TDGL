@@ -38,8 +38,8 @@ class SolverOptions:
 
     # === Parameters of Poisson solver ===
     poisson_tolerance_init: float = 1e-4      # Initial tolerance
-    poisson_tolerance_max: float = 5e-4     # Maximum tolerance
-    poisson_tolerance_min: float = 1e-6       # Minimum tolerance
+    poisson_tolerance_max: float = 1e-3     # Maximum tolerance
+    poisson_tolerance_min: float = 5e-6       # Minimum tolerance
     poisson_iterations: int = 5000                 # Maximum number of iterations
     poisson_adaptive: bool = True                  # Use adaptive tolerance
 

@@ -111,38 +111,25 @@ class Solution:
     # =========================================================================
 
     def get_spatial_data(self, step: int = -1) -> Dict[str, np.ndarray]:
-        """
-        Get spatial fields at a specific time step.
-
-        Args:
-            step: Step index (0, 1, 2, ...) or negative for relative
-                  (-1 = last, -2 = second to last, etc.).
-
-        Returns:
-            Dictionary with keys: 'psi', 'mu', 'supercurrent_x', 'supercurrent_y',
-            'div_Js', 'normal_current', 'time', 'dt', 'step'.
-
-        # Example:
-        #     >>> data = sol.get_spatial_data(step=-1)
-        #     >>> psi = data['psi']
-        #     >>> mu = data['mu']
-        # """
         if step < 0:
             step = self._saved_steps[step]
         elif step not in self._saved_steps:
             raise ValueError(f"Step {step} not found. Available: {self._saved_steps}")
-
         with h5py.File(self.path, 'r') as f:
             grp = f['data'][str(step)]
             data = {
                 'time': grp.attrs.get('time', 0.0),
                 'dt': grp.attrs.get('dt', 0.0),
                 'step': grp.attrs.get('step', step),
+                'Bz': grp.attrs.get('Bz', None),
+                'eta': grp.attrs.get('eta', None),
+                'gamma': grp.attrs.get('gamma', None),
+                's_applied': np.array(grp.attrs['s_applied']) if 's_applied' in grp.attrs else None,
             }
-            for key in ['psi', 'mu', 'supercurrent_x', 'supercurrent_y', 'div_Js', 'normal_current']:
+            for key in ['psi', 'mu', 'psi_derivatives', 'supercurrent_x', 'supercurrent_y',
+                        'div_Js', 'normal_current', 'A_applied', 'J_boundary']:
                 if key in grp:
                     data[key] = np.array(grp[key])
-
         return data
 
     # =========================================================================

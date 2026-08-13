@@ -81,10 +81,25 @@ class Device:
             max_edge_length: float = 0.5,
             n_lsfd_neighbors: int = 15,
             smooth: int = 0,
+            graded_smooth: bool = False,   # ← новый флаг
+            lloyd_step: float = 0.5,
+            lloyd_tol: float = 1e-3,
             ghost_coeff: float = 1,
             **meshpy_kwargs,
     ) -> None:
-        """Сгенерировать сетку и найти терминалы."""
+        """Сгенерировать сетку и найти терминалы.
+
+        Args:
+            max_edge_length: Максимальная длина ребра.
+            n_lsfd_neighbors: Число соседей для LSFD.
+            smooth: Число итераций сглаживания.
+            graded_smooth: Если True, использовать Lloyd's algorithm (CVT)
+                          вместо Laplacian smoothing.
+            lloyd_step: Доля смещения за шаг в Lloyd (0.3–0.7).
+            lloyd_tol: Порог сходимости для Lloyd.
+            ghost_coeff: Коэффициент для ghost points.
+            **meshpy_kwargs: Передаются в generate_mesh().
+        """
         logger.info("Generating mesh...")
 
         # 1. Генерируем триангуляцию
@@ -97,17 +112,27 @@ class Device:
 
         # 2. Сглаживание (ЕСЛИ нужно) — ДО создания полной структуры!
         if smooth > 0:
-            logger.info(f"Smoothing mesh ({smooth} iterations)...")
             temp_mesh = Mesh(
-                sites=points,
-                elements=triangles,
+                sites=points, elements=triangles,
                 boundary_indices=Mesh._find_boundary_indices(triangles),
-                n_lsfd_neighbors=n_lsfd_neighbors,
-                ghost_coeff = ghost_coeff
+                n_lsfd_neighbors=n_lsfd_neighbors, ghost_coeff=ghost_coeff,
             )
-            smoothed_mesh = temp_mesh.smooth(iterations=smooth, create_submesh=False)
-            points = smoothed_mesh.sites
-            triangles = smoothed_mesh.elements
+
+            if graded_smooth:
+                logger.info(f"Applying Lloyd's (CVT) smoothing (max {smooth} iterations)...")
+                smoothed = temp_mesh.smooth_lloyd(
+                    iterations=smooth,
+                    step=lloyd_step,
+                    convergence_tol=lloyd_tol,
+                    create_submesh=False,
+                    verbose=True,
+                )
+            else:
+                logger.info(f"Applying Laplacian smoothing ({smooth} iterations)...")
+                smoothed = temp_mesh.smooth(iterations=smooth, create_submesh=False)
+
+            points = smoothed.sites
+            triangles = smoothed.elements
 
         # 3. Создаём ПОЛНЫЙ Mesh ОДИН РАЗ
         logger.info("Creating full Mesh object...")

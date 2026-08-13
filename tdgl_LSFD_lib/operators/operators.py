@@ -4,6 +4,7 @@ import time
 import itertools as it
 import numpy as np
 import scipy.sparse as sp
+from scipy.misc import derivative
 from sklearn.neighbors import NearestNeighbors
 from scipy.sparse.linalg import factorized, spsolve, splu
 from scipy.sparse import lil_matrix, bmat, csc_matrix, coo_matrix
@@ -270,7 +271,9 @@ class LSFD_operators:
         else:
             W_matrix = (np.exp(- d ** 2)).astype(self.dtype)
 
+        #W_matrix = self._apply_boundary_boost(W_matrix, nb_dist, matrix_type)
         return W_matrix
+
 
     def compute_S_matrix(self, s_direction: np.ndarray, matrix_type: str = 'psi',  # 'psi', 'psi_gamma', или 'mu'
     ) -> np.ndarray:
@@ -380,8 +383,6 @@ class LSFD_operators:
             raise ValueError(f'Wrong matrix_type: {matrix_type}. '
                              f'Choose psi, psi_gamma, or mu')
 
-
-
         STW = np.einsum('nji,ni->nji', S.transpose(0, 2, 1), W)
         STWS = np.einsum('nji,nik->njk', STW, S)
 
@@ -391,7 +392,7 @@ class LSFD_operators:
             conds = np.array([np.linalg.cond(STWS[i]) for i in range(self.n_sites)])
             self.cond_stats[matrix_type] = conds
 
-        STWS_inv = np.linalg.inv(STWS)
+        STWS_inv = np.linalg.inv(STWS) #np.linalg.inv(STWS)
         HSTWS_inv = np.einsum('nj,nji->nji', H, STWS_inv)
         G = np.einsum('njk,nki->nji', HSTWS_inv, STW)
 
@@ -439,8 +440,12 @@ class LSFD_operators:
         # Индексы центральных точек (повторяются K раз)
         i_idx = np.repeat(np.arange(N_sites), K)  # (N*K,)
 
+        # mask = (self.nb_indices_psi == self.nb_indices)
+        #
+        # print(mask)
+
         # Индексы соседних точек
-        j_idx = self.nb_indices.flatten()  # (N*K,)
+        j_idx = self.nb_indices_psi.flatten()  # (N*K,)
 
         self.psi_i_idx = i_idx  # (N*K,)
         self.psi_j_idx = j_idx  # (N*K,)
@@ -464,7 +469,7 @@ class LSFD_operators:
 
         # Вычисляем новый U_link
 
-        A_i = A_applied[self.psi_i_idx]  # (N*K, 2)
+        A_i = A_applied[self.psi_i_idx]   # (N*K, 2)
         A_dot_e = np.einsum('ij,ij->i', A_i, self.nb_edge_vectors_flat)  # (N*K,)
         U_link = np.cos(A_dot_e) - 1j * np.sin(A_dot_e) #np.exp(-1j * A_dot_e)  # (N*K,)
         #U_link = U_link.reshape(self.n_sites, self.lsfd_neighbors_amount)  # (N, K)
@@ -474,8 +479,39 @@ class LSFD_operators:
         self._A_cache = A_applied.copy()
         return U_link
 
+    def compute_ghost_values(self, psi: np.ndarray, A_applied: np.ndarray, s_applied: np.ndarray,
+                          eta: float, psi_derivatives: np.ndarray = None):
+
+        #print('Ghost_dist', self.ghost_dist)
+
+        n_vec = self.normal_vecs
+        nx,ny = n_vec[:, 0], n_vec[:, 1]
+        s_x, s_y = s_applied[0], s_applied[1]
+        n_dot_s = nx * s_x + ny * s_y
+        psi_b = psi[self.boundary_indices]
+
+        if psi_derivatives is None:
+            D_xx = np.zeros_like(psi_b)
+            D_yy = np.zeros_like(psi_b)
+            D_xy = np.zeros_like(psi_b)
+        else:
+            D_xx = psi_derivatives[:, 2][self.boundary_indices]
+            D_yy = psi_derivatives[:, 3][self.boundary_indices]
+            D_xy = psi_derivatives[:, 4][self.boundary_indices]
+
+        A_i = A_applied[self.boundary_indices]  # (B, 2)
+        A_dot_e = np.einsum('ij,ij->i', A_i, self.ghost_coords)  # (N*K,)
+        U_link_ghost = np.cos(A_dot_e) + 1j * np.sin(A_dot_e)  # np.exp(1j * A_dot_e)  # (N*K,)
+        psi_ghost = U_link_ghost * (
+                    psi_b - 1j * eta * n_dot_s * psi_b * self.ghost_dist
+                    #+ 0.5 * D_xx * (nx * self.ghost_dist)**2 + 0.5 * D_yy * (ny * self.ghost_dist)**2
+                    #+ D_xy * (nx * self.ghost_dist) * (ny * self.ghost_dist)
+        )
+
+        return psi_ghost
+
     def compute_delta_psi(self, psi: np.ndarray, A_applied: np.ndarray, s_applied: np.ndarray,
-                          eta: float, gamma: float, Bz: float):
+                          eta: float, gamma: float, Bz: float, psi_derivatives: np.ndarray = None):
         """
         Вычисляет разности psi с калибровочными фазами.
 
@@ -495,10 +531,7 @@ class LSFD_operators:
         n_dot_s = n_vec[:, 0] * s_x + n_vec[:, 1] * s_y
 
         if self.use_ghost_points:
-            A_i = A_applied[self.boundary_indices]  # (B, 2)
-            A_dot_e = np.einsum('ij,ij->i', A_i, self.ghost_coords)  # (N*K,)
-            U_link_ghost = np.cos(A_dot_e) + 1j * np.sin(A_dot_e)  # np.exp(-1j * A_dot_e)  # (N*K,)
-            psi_ghost = U_link_ghost * (psi[self.boundary_indices] -1j * eta * n_dot_s * psi[self.boundary_indices] * self.ghost_dist)
+            psi_ghost = self.compute_ghost_values(psi,A_applied, s_applied, eta, psi_derivatives)
             psi_ext = np.concatenate([psi_ghost, psi])
 
             if self._use_sparse_delta == False:
@@ -584,7 +617,7 @@ class LSFD_operators:
     # Функции для вычисления RHS для mu derivetives
 
     def compute_mu_rhs(self, mu_guess: np.ndarray, div_J: np.ndarray,
-                       I_boundary: np.ndarray):
+                       I_boundary: np.ndarray, derivatives: np.ndarray):
         """
         Вычисляет правую часть для уравнения Пуассона.
 
@@ -599,7 +632,15 @@ class LSFD_operators:
         # Основное заполнение: mu[neighbor_j]
 
         if self.use_ghost_points:
-            mu_ghost = mu_guess[self.boundary_indices] + I_boundary * self.ghost_dist
+
+            mu_xx = derivatives[:, 3][self.boundary_indices]
+            mu_yy = derivatives[:, 4][self.boundary_indices]
+            mu_xy = derivatives[:, 5][self.boundary_indices]
+            x = self.ghost_coords[:, 0]
+            y = self.ghost_coords[:, 1]
+
+            mu_ghost = (mu_guess[self.boundary_indices] + I_boundary * self.ghost_dist ) #+
+                       # 0.5 * mu_xx * x**2 + 0.5 * mu_yy * y**2 + mu_xy * x*y
             mu_guess = np.concatenate([ mu_ghost, mu_guess])
 
         rhs = mu_guess[self.mu_rhs_indices]  # (N, K)
@@ -625,6 +666,8 @@ class LSFD_operators:
             mu_guess = np.zeros(N_sites)
 
         mu = mu_guess.copy()
+        derivatives = np.zeros((N_sites, 15), dtype = self.dtype)
+
         final_error = 1.0  # Значение по умолчанию, если цикл не выполнится
         actual_iterations = max_iterations
         gradients = None
@@ -634,7 +677,7 @@ class LSFD_operators:
         G_matrix_mu = self.G_matrix_mu
 
         for iteration in range(max_iterations):
-            rhs = self.compute_mu_rhs(mu, div_J, I_boundary)
+            rhs = self.compute_mu_rhs(mu, div_J, I_boundary, derivatives)
             #derivatives = np.einsum('nji,ni->nj', self.G_matrix_mu, rhs, optimize='optimal')
             derivatives = batched_dot(G_matrix_mu, rhs)
 
@@ -686,3 +729,508 @@ class LSFD_operators:
                 status = "❌ Risky (check mesh/neighbors)"
             print(f"{mtype:<12s} | {c_min:<10.2e} {c_mean:<10.2e} {c_max:<10.2e} {status}")
         print("="*65 + "\n")
+
+    def plot_condition_numbers(
+            self,
+            matrix_type: str = 'psi',
+            subtract_min: bool = True,
+            log_scale: bool = True,
+            highlight_boundary: bool = True,
+            ax=None,
+            figsize=(10, 8),
+            cmap='viridis',
+            marker_size: float = 2.0,
+            show_colorbar: bool = True,
+            show_stats: bool = True,
+    ):
+        """
+        Визуализирует числа обусловленности LSFD-матриц для каждой вершины.
+
+        Args:
+            matrix_type: Тип матрицы ('psi', 'psi_gamma', 'mu').
+                        Должен быть предварительно вычислен с check_condition_number=True.
+            subtract_min: Если True, строит (cond - min(cond)) для лучшего контраста.
+            log_scale: Если True (и subtract_min=False), использует лог-шкалу для цветов.
+            highlight_boundary: Если True, выделяет граничные точки красной обводкой.
+            ax: Matplotlib axes (если None, создаётся новый).
+            figsize: Размер фигуры.
+            cmap: Цветовая карта.
+            marker_size: Размер маркеров для внутренних точек.
+            show_colorbar: Показывать ли цветовую шкалу.
+            show_stats: Показывать ли текстовую статистику в углу.
+
+        Returns:
+            fig, ax
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LogNorm, Normalize
+
+        if matrix_type not in self.cond_stats:
+            raise ValueError(
+                f"Condition numbers for '{matrix_type}' not computed.\n"
+                f"Available: {list(self.cond_stats.keys())}.\n"
+                f"Создайте LSFD_operators с check_condition_number=True."
+            )
+
+        conds = self.cond_stats[matrix_type].copy()
+
+        if subtract_min:
+            conds_plot = conds - conds.min()
+            label = f"cond(SᵀWS) − {conds.min():.2e}"
+            use_log = False  # после вычитания min лог-шкала не нужна
+        else:
+            conds_plot = conds
+            label = f"cond(SᵀWS)"
+            use_log = log_scale
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.get_figure()
+
+        # Маска границы
+        is_boundary = np.zeros(self.n_sites, dtype=bool)
+        is_boundary[self.boundary_indices] = True
+
+        # Цветовая норма
+        if use_log:
+            norm = LogNorm(vmin=conds_plot.min() + 1e-15, vmax=conds_plot.max())
+        else:
+            norm = Normalize(vmin=conds_plot.min(), vmax=conds_plot.max())
+
+        # Отрисовка
+        if highlight_boundary:
+            # Сначала внутренние (мелкие маркеры)
+            sc_int = ax.scatter(
+                self.sites[~is_boundary, 0],
+                self.sites[~is_boundary, 1],
+                c=conds_plot[~is_boundary],
+                s=marker_size,
+                cmap=cmap,
+                norm=norm,
+                alpha=0.8,
+            )
+            # Потом граничные (крупнее, с красной обводкой)
+            sc_bnd = ax.scatter(
+                self.sites[is_boundary, 0],
+                self.sites[is_boundary, 1],
+                c=conds_plot[is_boundary],
+                s=marker_size * 4,
+                cmap=cmap,
+                norm=norm,
+                edgecolors='red',
+                linewidths=0.6,
+                alpha=1.0,
+            )
+            sc_for_cbar = sc_int
+        else:
+            sc_for_cbar = ax.scatter(
+                self.sites[:, 0],
+                self.sites[:, 1],
+                c=conds_plot,
+                s=marker_size,
+                cmap=cmap,
+                norm=norm,
+            )
+
+        if show_colorbar:
+            cbar = plt.colorbar(sc_for_cbar, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(label, fontsize=11)
+
+        ax.set_aspect('equal')
+        ax.set_xlabel('x [ξ]')
+        ax.set_ylabel('y [ξ]')
+        ax.set_title(f'Condition numbers: {matrix_type}', fontsize=13, fontweight='bold')
+
+        if show_stats:
+            # Статистика отдельно для границы и внутренности
+            bnd_mean = conds[is_boundary].mean() if is_boundary.any() else 0
+            int_mean = conds[~is_boundary].mean() if (~is_boundary).any() else 0
+            bnd_max = conds[is_boundary].max() if is_boundary.any() else 0
+
+            # Топ-5 худших точек
+            worst_idx = np.argsort(conds)[-5:][::-1]
+            worst_text = "\n".join([
+                f"  #{idx}: cond={conds[idx]:.2e} at ({self.sites[idx, 0]:.2f}, {self.sites[idx, 1]:.2f})"
+                + (" [BND]" if is_boundary[idx] else "")
+                for idx in worst_idx
+            ])
+
+            stats_text = (
+                f"Min: {conds.min():.2e}   Max: {conds.max():.2e}\n"
+                f"Mean (int): {int_mean:.2e}   Mean (bnd): {bnd_mean:.2e}\n"
+                f"Max (bnd): {bnd_max:.2e}\n"
+                f"── Top-5 worst ──\n{worst_text}"
+            )
+            ax.text(
+                0.02, 0.98, stats_text,
+                transform=ax.transAxes,
+                fontsize=8, family='monospace',
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7),
+            )
+
+        return fig, ax
+
+    def plot_condition_comparison(self, matrix_types=None, figsize=(18, 6)):
+        """
+        Сравнивает condition numbers для нескольких типов матриц side-by-side.
+
+        Args:
+            matrix_types: Список типов ('psi', 'psi_gamma', 'mu').
+                         Если None, использует все доступные.
+            figsize: Размер фигуры.
+        """
+        import matplotlib.pyplot as plt
+
+        if matrix_types is None:
+            matrix_types = list(self.cond_stats.keys())
+
+        available = [m for m in matrix_types if m in self.cond_stats]
+        if not available:
+            raise ValueError(
+                f"No condition numbers computed for {matrix_types}.\n"
+                f"Available: {list(self.cond_stats.keys())}."
+            )
+
+        fig, axes = plt.subplots(1, len(available), figsize=figsize, constrained_layout=True)
+        if len(available) == 1:
+            axes = [axes]
+
+        for ax, mtype in zip(axes, available):
+            self.plot_condition_numbers(matrix_type=mtype, ax=ax, show_stats=True)
+
+        return fig, axes
+
+    def plot_condition_vs_distance(
+            self,
+            matrix_type: str = 'psi',
+            figsize=(12, 5),
+    ):
+        """
+        Строит зависимость condition number от расстояния до границы.
+        Показывает, портится ли обусловленность у границы.
+
+        Args:
+            matrix_type: Тип матрицы.
+            figsize: Размер фигуры.
+
+        Returns:
+            fig, axes (2 subplot'а: scatter + binned mean)
+        """
+        import matplotlib.pyplot as plt
+
+        if matrix_type not in self.cond_stats:
+            raise ValueError(f"Condition numbers for '{matrix_type}' not computed.")
+
+        conds = self.cond_stats[matrix_type]
+
+        # Расстояние до ближайшей граничной точки
+        bnd_tree = KDTree(self.sites[self.boundary_indices])
+        dist_to_bnd, _ = bnd_tree.query(self.sites)
+
+        is_boundary = np.zeros(self.n_sites, dtype=bool)
+        is_boundary[self.boundary_indices] = True
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+
+        # === Левый subplot: scatter plot ===
+        ax1 = axes[0]
+        sc = ax1.scatter(
+            dist_to_bnd, conds,
+            c=np.where(is_boundary, 'red', 'steelblue'),
+            s=3, alpha=0.6,
+        )
+        ax1.set_yscale('log')
+        ax1.set_xlabel('Distance to boundary [ξ]')
+        ax1.set_ylabel(f'cond(SᵀWS) for {matrix_type}')
+        ax1.set_title('Condition number vs distance to boundary')
+        ax1.grid(True, alpha=0.3)
+
+        # Легенда
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=6, label='Boundary'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='steelblue', markersize=6, label='Interior'),
+        ]
+        ax1.legend(handles=legend_elements, loc='upper right')
+
+        # === Правый subplot: binned mean ===
+        ax2 = axes[1]
+        n_bins = 30
+        bins = np.linspace(0, dist_to_bnd.max(), n_bins + 1)
+        bin_idx = np.digitize(dist_to_bnd, bins) - 1
+        bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+
+        bin_means = np.zeros(n_bins)
+        bin_stds = np.zeros(n_bins)
+        bin_counts = np.zeros(n_bins, dtype=int)
+
+        for b in range(n_bins):
+            mask = bin_idx == b
+            if mask.any():
+                bin_means[b] = conds[mask].mean()
+                bin_stds[b] = conds[mask].std()
+                bin_counts[b] = mask.sum()
+
+        bin_centers = 0.5 * (bins[:-1] + bins[1:])
+        valid = bin_counts > 0
+
+        ax2.semilogy(bin_centers[valid], bin_means[valid], 'o-', color='steelblue',
+                     label='Mean cond')
+        ax2.fill_between(
+            bin_centers[valid],
+            bin_means[valid] - bin_stds[valid],
+            bin_means[valid] + bin_stds[valid],
+            alpha=0.2, color='steelblue', label='±1 std'
+        )
+        ax2.set_xlabel('Distance to boundary [ξ]')
+        ax2.set_ylabel(f'Mean cond(SᵀWS) for {matrix_type}')
+        ax2.set_title('Binned condition number vs distance')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+
+        return fig, axes
+
+    def save_top_bad_condition_numbers(
+            self,
+            filepath: str,
+            matrix_type: str = 'psi',
+            top_n: int = 10,
+    ) -> None:
+        """
+        Сохраняет топ-N точек с худшими числами обусловленности в текстовый файл.
+
+        Файл содержит:
+        - Общую статистику (min/mean/max отдельно для границы и внутренности)
+        - Топ-N худших точек в целом
+        - Топ-N худших точек ТОЛЬКО на границе
+        - Топ-N худших точек ТОЛЬКО внутри области
+
+        Args:
+            filepath: Путь к выходному .txt файлу.
+            matrix_type: Тип матрицы ('psi', 'psi_gamma', 'mu').
+            top_n: Количество худших точек для вывода (по умолчанию 10).
+        """
+        from pathlib import Path
+
+        if matrix_type not in self.cond_stats:
+            raise ValueError(
+                f"Condition numbers for '{matrix_type}' not computed.\n"
+                f"Available: {list(self.cond_stats.keys())}.\n"
+                f"Создайте LSFD_operators с check_condition_number=True."
+            )
+
+        conds = self.cond_stats[matrix_type]
+
+        # Определяем границу и внутренность
+        is_boundary = np.zeros(self.n_sites, dtype=bool)
+        is_boundary[self.boundary_indices] = True
+
+        # Расстояние до границы для каждой точки
+        bnd_tree = KDTree(self.sites[self.boundary_indices])
+        dist_to_bnd, _ = bnd_tree.query(self.sites)
+
+        # Тип точки
+        point_type = np.where(is_boundary, "BND", "INT")
+
+        # === Сборка общей таблицы данных ===
+        # Структура: (index, x, y, cond, dist_to_bnd, type)
+        data = []
+        for i in range(self.n_sites):
+            data.append({
+                'idx': i,
+                'x': self.sites[i, 0],
+                'y': self.sites[i, 1],
+                'cond': conds[i],
+                'dist': dist_to_bnd[i],
+                'type': point_type[i],
+            })
+
+        # Сортировки
+        sorted_all = sorted(data, key=lambda d: d['cond'], reverse=True)[:top_n]
+        sorted_bnd = sorted([d for d in data if d['type'] == "BND"],
+                            key=lambda d: d['cond'], reverse=True)[:top_n]
+        sorted_int = sorted([d for d in data if d['type'] == "INT"],
+                            key=lambda d: d['cond'], reverse=True)[:top_n]
+
+        # === Форматирование и запись в файл ===
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        # Статистика
+        cond_bnd = conds[is_boundary]
+        cond_int = conds[~is_boundary]
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("=" * 90 + "\n")
+            f.write(f" CONDITION NUMBER ANALYSIS: matrix_type = '{matrix_type}'\n")
+            f.write(
+                f" Total sites: {self.n_sites}  |  Boundary: {is_boundary.sum()}  |  Interior: {(~is_boundary).sum()}\n")
+            f.write("=" * 90 + "\n\n")
+
+            # Общая статистика
+            f.write("GLOBAL STATISTICS:\n")
+            f.write("-" * 90 + "\n")
+            f.write(f"{'Category':<15} {'Min':>12} {'Mean':>12} {'Median':>12} {'Max':>12} {'Count':>8}\n")
+            f.write("-" * 90 + "\n")
+            f.write(f"{'ALL':<15} {conds.min():>12.2e} {conds.mean():>12.2e} "
+                    f"{np.median(conds):>12.2e} {conds.max():>12.2e} {len(conds):>8d}\n")
+            if len(cond_bnd) > 0:
+                f.write(f"{'BOUNDARY':<15} {cond_bnd.min():>12.2e} {cond_bnd.mean():>12.2e} "
+                        f"{np.median(cond_bnd):>12.2e} {cond_bnd.max():>12.2e} {len(cond_bnd):>8d}\n")
+            if len(cond_int) > 0:
+                f.write(f"{'INTERIOR':<15} {cond_int.min():>12.2e} {cond_int.mean():>12.2e} "
+                        f"{np.median(cond_int):>12.2e} {cond_int.max():>12.2e} {len(cond_int):>8d}\n")
+            f.write("\n")
+            f.write(f"Ratio Max(BND)/Max(INT): {cond_bnd.max() / (cond_int.max() + 1e-15):.2f}\n")
+            f.write(f"Ratio Mean(BND)/Mean(INT): {cond_bnd.mean() / (cond_int.mean() + 1e-15):.2f}\n\n")
+
+            # Вспомогательная функция для вывода таблицы
+            def write_table(title, data_list):
+                f.write(f"\n{title} (top {top_n}):\n")
+                f.write("-" * 90 + "\n")
+                f.write(f"{'Rank':<5} {'Idx':<7} {'Type':<5} "
+                        f"{'X [ξ]':>10} {'Y [ξ]':>10} {'Dist→Bnd':>10} {'Cond':>14}\n")
+                f.write("-" * 90 + "\n")
+                for rank, d in enumerate(data_list, start=1):
+                    f.write(f"{rank:<5} {d['idx']:<7} {d['type']:<5} "
+                            f"{d['x']:>10.4f} {d['y']:>10.4f} {d['dist']:>10.4f} {d['cond']:>14.2e}\n")
+                f.write("-" * 90 + "\n")
+
+            write_table("TOP WORST CONDITION NUMBERS (ALL SITES)", sorted_all)
+            write_table("TOP WORST CONDITION NUMBERS (BOUNDARY ONLY)", sorted_bnd)
+            write_table("TOP WORST CONDITION NUMBERS (INTERIOR ONLY)", sorted_int)
+
+            f.write("\n" + "=" * 90 + "\n")
+            f.write("END OF REPORT\n")
+            f.write("=" * 90 + "\n")
+
+        print(f"✅ Condition number report saved to: {filepath}")
+
+
+    def analyze_boundary_stencil(
+            self,
+            K_list=(30, 50, 70, 100, 170),
+            h_main: float = 0.5,
+            figsize=(16, 10),
+            save=None,
+    ):
+        """
+        Анализ структуры стенсила на граничных точках для разных K.
+
+        Для каждого K (не больше сохранённого n_lsfd_neighbors) вычисляет:
+          - domain radius d0 = расстояние до K-го соседа (vs координата θ и vs K);
+          - число соседей-граничных (n_bnd) и соседей-внутренних (n_int);
+          - число "основных" точек (dist < h_main): всего / граничных / внутренних.
+
+        Цель — понять, почему меньшее K улучшает границу: при большом K стенсил
+        перенасыщается тангенциальными граничными точками, а нормальная
+        (внутренняя) информация почти не прибавляется → растёт анизотропия фита.
+
+        Returns:
+            results: dict[K -> dict массивов по граничным точкам]
+        """
+        import matplotlib.pyplot as plt
+
+        nb = self.mesh.lsfd_neighbors
+        idx_full = nb.indices      # (N, Kmax), отсортированы по расстоянию
+        dist_full = nb.distances   # (N, Kmax)
+        Kmax = idx_full.shape[1]
+
+        is_bnd = np.zeros(self.n_sites, dtype=bool)
+        is_bnd[self.boundary_indices] = True
+        b = self.boundary_indices
+
+        # Сортировка вдоль дуги (для диска — по углу)
+        theta = np.degrees(np.arctan2(self.sites[b, 1], self.sites[b, 0]))
+        order = np.argsort(theta)
+        theta_sorted = theta[order]
+        b_sorted = b[order]
+
+        results = {}
+        summary_rows = []
+
+        fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+
+        for K in K_list:
+            K = int(min(K, Kmax))
+            if K != K and K > Kmax:
+                print(f"Warning: K={K} > Kmax={Kmax}, clipped to {Kmax}")
+
+            dK = dist_full[b_sorted, :K]     # (Nb, K)
+            iK = idx_full[b_sorted, :K]      # (Nb, K)
+
+            domain_radius = dK[:, -1]
+            is_bnd_nb = is_bnd[iK]           # (Nb, K)
+            n_bnd = is_bnd_nb.sum(axis=1)
+            n_int = K - n_bnd
+
+            main_mask = dK < h_main
+            n_main = main_mask.sum(axis=1)
+            n_main_bnd = (main_mask & is_bnd_nb).sum(axis=1)
+            n_main_int = (main_mask & ~is_bnd_nb).sum(axis=1)
+
+            results[K] = {
+                'theta': theta_sorted,
+                'domain_radius': domain_radius,
+                'n_bnd': n_bnd,
+                'n_int': n_int,
+                'n_main': n_main,
+                'n_main_bnd': n_main_bnd,
+                'n_main_int': n_main_int,
+            }
+
+            # 1) domain radius vs θ
+            axes[0, 0].plot(theta_sorted, domain_radius, '.-', ms=1.5, lw=0.6,
+                            label=f'K={K}')
+            # 2) доля граничных соседей среди K vs θ
+            axes[0, 1].plot(theta_sorted, n_bnd / K, '.-', ms=1.5, lw=0.6,
+                            label=f'K={K}')
+            # 4) внутренние "основные" точки vs θ (нормальная информация)
+            axes[1, 1].plot(theta_sorted, n_main_int, '.-', ms=1.5, lw=0.6,
+                            label=f'K={K}')
+
+            summary_rows.append((
+                K,
+                domain_radius.mean(), domain_radius.min(), domain_radius.max(),
+                n_bnd.mean(), n_int.mean(),
+                n_main.mean(), n_main_bnd.mean(), n_main_int.mean(),
+            ))
+
+        axes[0, 0].set_title('domain radius $d_0$ vs θ')
+        axes[0, 0].set_ylabel('$d_0$ [ξ]')
+        axes[0, 0].grid(alpha=0.3); axes[0, 0].legend()
+
+        axes[0, 1].set_title('доля граничных (тангенциальных) соседей среди K')
+        axes[0, 1].set_ylabel('$n_{bnd}/K$')
+        axes[0, 1].grid(alpha=0.3); axes[0, 1].legend()
+
+        # 3) средние счётчики "основных" точек vs K
+        Ks = [r[0] for r in summary_rows]
+        axes[1, 0].plot(Ks, [r[6] for r in summary_rows], 'o-', label='main: всего (dist<h)')
+        axes[1, 0].plot(Ks, [r[7] for r in summary_rows], 's-', label='main: граничные')
+        axes[1, 0].plot(Ks, [r[8] for r in summary_rows], '^-', label='main: внутренние')
+        axes[1, 0].set_title('среднее число "основных" точек (dist < h)')
+        axes[1, 0].set_xlabel('K')
+        axes[1, 0].grid(alpha=0.3); axes[1, 0].legend()
+
+        axes[1, 1].set_title('внутренние "основные" точки vs θ (нормальная инф.)')
+        axes[1, 1].set_xlabel('θ [deg]')
+        axes[1, 1].grid(alpha=0.3); axes[1, 1].legend()
+
+        if save:
+            fig.savefig(save, dpi=150, bbox_inches='tight')
+
+        # Текстовая сводка
+        print(f"\n📐 Boundary stencil analysis (h_main = {h_main:.2f}):")
+        print("=" * 105)
+        print(f"{'K':>4} | {'d0 mean':>8} {'min':>7} {'max':>7} | "
+              f"{'n_bnd':>6} {'n_int':>6} | {'main':>6} {'m_bnd':>6} {'m_int':>6}")
+        print("-" * 105)
+        for r in summary_rows:
+            print(f"{r[0]:>4} | {r[1]:>8.3f} {r[2]:>7.3f} {r[3]:>7.3f} | "
+                  f"{r[4]:>6.1f} {r[5]:>6.1f} | {r[6]:>6.1f} {r[7]:>6.1f} {r[8]:>6.1f}")
+        print("=" * 105 + "\n")
+
+        return results

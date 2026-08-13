@@ -3,7 +3,7 @@ from typing import NamedTuple, Optional, Tuple
 from collections import deque
 
 from ..device.device import Device
-from ..external_fields.external_fields import ExternalFields
+from ..external_fields.external_fields import ExternalFields, StepFields
 from ..operators.operators import LSFD_operators
 from .dynamics_options import SolverOptions, TimeScheme
 import logging
@@ -36,6 +36,7 @@ class StepResult(NamedTuple):
         conservation_global: Global conservation check tuple
         conservation_local: Local conservation check tuple
     """
+    # === Физические величины ===
     psi: np.ndarray  # (N,) complex128
     psi_abs_sq: np.ndarray  # (N,) float64
     psi_derivatives: np.ndarray  # (N, 14) complex128
@@ -44,15 +45,19 @@ class StepResult(NamedTuple):
     supercurrent_y: np.ndarray  # (N,) float64
     div_Js: np.ndarray  # (N,) float64
     normal_current: np.ndarray  # (N, 2) float64
+
+    # === Динамика (НОВОЕ) ===
+    t: float
     dt: float  # scalar
-    s_applied: np.ndarray  # (2,) float64
-    Bz: float  # scalar
-    eta: float  # scalar
-    gamma: float  # scalar
     poisson_tolerance: float # scalar
     poisson_residual: np.ndarray  # (N,) float64
     poisson_iterations: int  # scalar
 
+    # === Динамика (НОВОЕ) ===
+    Bz: float
+    eta: float
+    gamma: float
+    s_applied: np.ndarray   # (2,)
 
 # ============================================================================
 # TDGL SOLVER
@@ -93,9 +98,13 @@ class TDGLSolver:
         else:
             self.operators._use_sparse_delta = True
 
+        self.operators._use_sparse_delta = False
+        print('Sparce', self.operators._use_sparse_delta)
+
         self.A_for_constant_Bz = self.external_fields.calculate_fixed_applied_vector_potential(
             x=mesh.sites[:, 0], y=mesh.sites[:, 1]
         )
+
 
         # === TERMINALS ===
         if device.terminals:
@@ -131,6 +140,11 @@ class TDGLSolver:
         self.s_applied = self.external_fields.s_constant
         self.s_previous = self.external_fields.s_constant.copy()
 
+
+        # === SIMULATION CLOCK (moved from Runner) <-- NEW ===
+        self.t = 0.0
+        self.dt = options.dt_init
+
         # === ИСТОРИЯ ДЛЯ АДАПТИВНОГО ШАГА ===
         self.d_psi_sq_history = deque(maxlen=options.adaptive_window)
 
@@ -138,10 +152,11 @@ class TDGLSolver:
         self.poisson_iterations_history = deque(maxlen=options.adaptive_window)
 
     def compute_psi_derivatives(self, psi: np.ndarray, A_applied: np.ndarray,
-                                s_applied: np.ndarray, eta: float, gamma: float, Bz: float):
+                                s_applied: np.ndarray, eta: float, gamma: float,
+                                Bz: float, psi_derivatives: np.ndarray = None):
         """Вычисляет все производные psi через LSFD."""
         delta_psi = self.operators.compute_delta_psi(
-            psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz
+            psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz, psi_derivatives = psi_derivatives
         )
         psi_derivatives = self.operators._batched_dot(
             self.operators.G_matrix_psi_gamma, delta_psi
@@ -150,14 +165,14 @@ class TDGLSolver:
 
     def solve_mu(self, div_J: np.ndarray, J_boundary: np.ndarray,
                  mu_guess: np.ndarray = None,
-                 tolerance: float = 1e-5, max_iterations: int = 1000):
+                 tolerance: float = 1e-4, max_iterations: int = 1000):
         """Решает уравнение Пуассона для μ."""
 
         # mu = np.zeros_like(div_J)
         # gradients = np.zeros((len(div_J), 2))
         # actual_iters = 0
         # residual = np.zeros_like(div_J)
-        #
+
         mu, gradients, laplacian, achieved_iter_error, actual_iters = self.operators.solve_poisson(
                 div_J=div_J,
                 I_boundary=J_boundary,
@@ -256,7 +271,7 @@ class TDGLSolver:
 
         if gamma == 0:
             psi = U * (psi + (dt / u) * (
-                    psi * (1 - abs_sq_psi) +
+                    psi * (1  - abs_sq_psi) +       # gauge test!!!!!!! + 0.25
                     Dpsi_xx + Dpsi_yy +
                     2 * eta * 1j * (s_x * Dpsi_x + s_y * Dpsi_y)
             ))
@@ -272,19 +287,93 @@ class TDGLSolver:
         new_sq_psi = np.absolute(psi) ** 2
         return psi, new_sq_psi
 
+    def get_fields_at(self, t: float) -> StepFields:
+        """Собрать все поля на момент t одним вызовом."""
+        A_applied, Bz = self.external_fields.update_vector_potential(t)
+        J_boundary = self.external_fields.update_mu_boundary(t)
+        eta, gamma = self.external_fields.get_ferromagnetic(t)
+        s_applied = self.external_fields.update_s_direction(t)
+        return StepFields(
+            A_applied=A_applied, Bz=Bz, J_boundary=J_boundary,
+            eta=eta, gamma=gamma, s_applied=s_applied,
+        )
 
     def solve_for_one_step(self, psi: np.ndarray, psi_abs_sq: np.ndarray,
-                           mu: np.ndarray, t: float, dt: float) -> StepResult:
+                           mu: np.ndarray,
+                           fields: Optional[StepFields] = None,
+                           psi_derivatives: Optional[np.ndarray] = None,
+                           ) -> Tuple[StepResult, StepFields]:
         """
         Один шаг TDGL динамики с адаптивным шагом по времени.
         """
         options = self.options
 
-        # 1) Get external fields
-        A_applied, Bz = self.external_fields.update_vector_potential(t)
-        J_boundary = self.external_fields.update_mu_boundary(t)
-        eta, gamma = self.external_fields.get_ferromagnetic(t)
-        s_applied = self.external_fields.update_s_direction(t)
+        t = self.t
+        dt = self.dt
+
+        # print(psi)
+        # print(np.max(psi_abs_sq), np.argmax(psi_abs_sq))
+
+        # 1) Get current external fields - obtain A(t), Bz(t), J(t), eta(t), gamma(t), s(t)
+
+        if fields is None:
+            fields = self.external_fields.get_fields_at(t)
+            A_applied = fields.A_applied
+            s_applied = fields.s_applied
+            eta =  fields.eta
+            gamma = fields.gamma
+            Bz = fields.Bz
+        else:
+            A_applied = fields.A_applied
+            s_applied = fields.s_applied
+            eta =  fields.eta
+            gamma = fields.gamma
+            Bz = fields.Bz
+
+        if psi_derivatives is None:
+            psi_derivatives = self.compute_psi_derivatives(
+                psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz, psi_derivatives = psi_derivatives
+            )
+
+        # 2) Solve TDGL equation for psi - obtain psi(t+1)
+        psi, new_psi_abs_sq = self.solve_for_psi_squared(
+            psi=psi, psi_derivatives=psi_derivatives,
+            abs_sq_psi=psi_abs_sq, mu=mu,
+            dt=dt, gamma=gamma, eta=eta, s_applied=s_applied, Bz=Bz
+        )
+
+        # 3) Update t and dt - t_n+1 = t_n + dt_n, dt_n+1 = func(dt_n, psi_n, psi_n+1 )
+
+        new_dt = dt
+        if options.time_scheme == TimeScheme.ADAPTIVE_EULER:
+            diff = np.abs(new_psi_abs_sq - psi_abs_sq)
+            # <-- CHANGED: percentile instead of max, robust to boundary spikes
+            pctl = getattr(options, 'dt_delta_percentile', 100.0)
+            delta = float(np.percentile(diff, pctl))
+
+            self.d_psi_sq_history.append(delta)
+            if len(self.d_psi_sq_history) >= options.adaptive_window:
+                delta_n = max(float(np.mean(self.d_psi_sq_history)), 1e-15)
+                dt_candidate = options.dt_init / delta_n
+                dt_smooth = 0.5 * (dt_candidate + dt)
+                new_dt = max(options.dt_min, min(dt_smooth, options.dt_max))
+                self.d_psi_sq_history.clear()
+
+        self.t = t + dt
+        self.dt = new_dt
+
+        # 4) Update external_fields A(t -> t+1)
+
+        fields = self.external_fields.get_fields_at(self.t)
+
+        A_applied = fields.A_applied
+        J_boundary = fields.J_boundary
+        s_applied = fields.s_applied
+        eta = fields.eta
+        gamma = fields.gamma
+        Bz = fields.Bz
+
+        #A_applied = A_applied - 0.5 * self.s_applied # gauge_test!!!!!!!!
 
         # Обновление G при вращении s (если нужно)
         if gamma != 0:
@@ -293,30 +382,19 @@ class TDGLSolver:
                 self.operators.update_G_matrix_psi_gamma(s_direction=s_applied)
                 self.s_previous = s_applied.copy()
 
-        # 2) Compute psi_derivatives
+        # 5) Compute psi_derivatives (t+1)
+
         psi_derivatives = self.compute_psi_derivatives(
-            psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz
+            psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz, psi_derivatives = psi_derivatives
         )
 
-        # 3) Solve TDGL equation for psi
-        psi, new_psi_abs_sq = self.solve_for_psi_squared(
-            psi=psi, psi_derivatives=psi_derivatives,
-            abs_sq_psi=psi_abs_sq, mu=mu,
-            dt=dt, gamma=gamma, eta=eta, s_applied=s_applied, Bz=Bz
-        )
-
-        # 3.5) Пересчитать производные для НОВОГО psi
-        psi_derivatives = self.compute_psi_derivatives(
-            psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz
-        )
-
-        # 4) Get supercurrent
+        # 6) Get supercurrent
         supercurrent_x, supercurrent_y, s_grad_psi = self.get_supercurrent(
             psi=psi, psi_derivatives=psi_derivatives,
             s_applied=s_applied, eta=eta, gamma=gamma
         )
 
-        # 5) Get divergence J
+        # 7) Get divergence J
         div_Js = self.compute_divergence_J(
             psi=psi, psi_derivatives=psi_derivatives,
             s_grad_psi=s_grad_psi, s_applied=s_applied, eta=eta, gamma=gamma
@@ -324,7 +402,7 @@ class TDGLSolver:
 
         div_Js = np.real(div_Js)
 
-        # 6) Solve Poisson equation for mu
+        # 8) Solve Poisson equation for mu
         mu_new, normal_current, poisson_residual, poisson_iterations = self.solve_mu(
             div_J=div_Js,
             J_boundary=J_boundary,
@@ -334,67 +412,34 @@ class TDGLSolver:
         )
 
         if options.poisson_adaptive:
-
             self.poisson_iterations_history.append(poisson_iterations)
             # Адаптация tolerance (каждые adaptive_window шагов)
             if len(self.poisson_iterations_history) == options.adaptive_window:
                 avg_iterations = np.mean(self.poisson_iterations_history)
 
-                # Логика:
-                # - Если avg_iterations < 10: система стабильна → ужесточить tolerance (к min)
-                # - Если avg_iterations > 100: система меняется быстро → ослабить tolerance (к max)
-
-                if avg_iterations < 10:
-                    new_tolerance = max(self.poisson_tolerance / 2, options.poisson_tolerance_min)
-                elif avg_iterations > 100:
-                    new_tolerance = min(self.poisson_tolerance * 2, options.poisson_tolerance_max)
+                if avg_iterations < 5:
+                    new_tolerance = 0.95 * self.poisson_tolerance
+                elif avg_iterations > 15:
+                    new_tolerance = 1.5 * self.poisson_tolerance
                 else:
                     new_tolerance = self.poisson_tolerance
 
                 # Плавное изменение
-                self.poisson_tolerance = 0.5 * (self.poisson_tolerance + new_tolerance)
+                self.poisson_tolerance = 0.8 * self.poisson_tolerance + 0.2 * new_tolerance
+                min_check = min(self.poisson_tolerance, options.poisson_tolerance_max)
+                self.poisson_tolerance = max(options.poisson_tolerance_min, min_check)
 
-                # Сбрасываем историю
-                self.poisson_iterations_history.clear()
-
-        # 7) АДАПТИВНЫЙ ШАГ
-        new_dt = dt  # По умолчанию оставляем текущий
-
-        if options.time_scheme == TimeScheme.ADAPTIVE_EULER:
-            # Вычисляем изменение |ψ|²
-            delta = float(np.max(np.abs(new_psi_abs_sq - psi_abs_sq)))
-            self.d_psi_sq_history.append(delta)
-
-            # Если окно заполнено — вычисляем новый dt
-            if len(self.d_psi_sq_history) == options.adaptive_window:
-                delta_n = np.mean(self.d_psi_sq_history)
-
-                # Формула из pyTDGL: dt_new = dt_init / delta_n
-                # Защита от деления на ноль
-                delta_n = max(delta_n, 1e-15)
-                dt_candidate = options.dt_init / delta_n
-
-                # Сглаживание: среднее между текущим и кандидатом
-                dt_smooth = 0.5 * (dt_candidate + dt)
-
-                # Ограничение диапазона
-                new_dt = max(options.dt_min, min(dt_smooth, options.dt_max))
-
-        return StepResult(
-            psi=psi,
-            psi_abs_sq=new_psi_abs_sq,
-            psi_derivatives=psi_derivatives,
-            mu=mu_new,
-            supercurrent_x=supercurrent_x,
-            supercurrent_y=supercurrent_y,
-            div_Js=div_Js,
-            normal_current=normal_current,
+        result = StepResult(
+            psi=psi, psi_abs_sq=new_psi_abs_sq, psi_derivatives=psi_derivatives,
+            mu=mu_new, supercurrent_x=supercurrent_x, supercurrent_y=supercurrent_y,
+            div_Js=div_Js, normal_current=normal_current,
+            t = self.t,
             dt=new_dt,
-            poisson_tolerance=self.poisson_tolerance,
-            poisson_residual=poisson_residual,
+            poisson_tolerance=self.poisson_tolerance, poisson_residual=poisson_residual,
             poisson_iterations=poisson_iterations,
-            s_applied=s_applied,
-            Bz=Bz,
+            Bz = Bz,
             eta=eta,
             gamma=gamma,
-        )
+            s_applied=s_applied,)
+
+        return result, fields

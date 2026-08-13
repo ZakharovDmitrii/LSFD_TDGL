@@ -366,10 +366,12 @@ def plot_summary(
 
     # 1. |ψ|
     ax1 = fig.add_subplot(2, 3, 1)
-    im1 = ax1.tripcolor(tri, np.abs(psi), cmap='viridis', vmin=0, vmax=1, shading='gouraud')
+    vmax = np.max(np.abs(psi))
+    im1 = ax1.tripcolor(tri, np.abs(psi), cmap='viridis', vmin=0, vmax=vmax, shading='gouraud')
     ax1.set_title(r'$|\psi|$')
     ax1.set_aspect('equal')
     fig.colorbar(im1, ax=ax1)
+
 
     # 2. phase(ψ)
     ax2 = fig.add_subplot(2, 3, 2)
@@ -381,6 +383,7 @@ def plot_summary(
 
     # 3. μ
     ax3 = fig.add_subplot(2, 3, 3)
+    mu = mu  - np.min(mu)
     im3 = ax3.tripcolor(tri, mu, cmap='magma', shading='gouraud')
     ax3.set_title(r'$\mu$')
     ax3.set_aspect('equal')
@@ -415,8 +418,8 @@ def plot_summary(
     # 6. div(Js)
     ax6 = fig.add_subplot(2, 3, 6)
     div_J_real = np.real(div_J)
-    im6 = ax6.tripcolor(tri, div_J_real, cmap='RdBu_r', shading='gouraud',
-                        vmin=-np.max(np.abs(div_J_real)), vmax=np.max(np.abs(div_J_real)))
+    div_J_real = div_J_real - np.min(div_J_real)
+    im6 = ax6.tripcolor(tri, div_J_real, cmap='RdBu_r', shading='gouraud')
     ax6.set_title(r'$\nabla \cdot J_s$')
     ax6.set_aspect('equal')
     fig.colorbar(im6, ax=ax6)
@@ -429,7 +432,6 @@ def plot_summary(
         print(f"✓ Saved to {save_path}")
 
     return fig
-
 
 # ============================================================================
 # 8. CONSERVATION TRACKER SUMMARY

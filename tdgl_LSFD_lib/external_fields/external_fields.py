@@ -1,7 +1,16 @@
 from typing import Optional, Tuple, Dict, Callable, Union, Literal
 import numpy as np
 
+from typing import NamedTuple
 
+class StepFields(NamedTuple):
+    """Все внешние поля на одном временном слое."""
+    A_applied: np.ndarray   # (N, 2)
+    Bz: float
+    J_boundary: np.ndarray  # (N_b,)
+    eta: float
+    gamma: float
+    s_applied: np.ndarray   # (2,)
 
 class  ExternalFields:
     """
@@ -290,3 +299,14 @@ class  ExternalFields:
             self.s_constant = np.array([-h_y, h_x])
 
             return self.s_constant
+
+    def get_fields_at(self, t: float) -> StepFields:
+        """Собрать все поля на момент t одним вызовом."""
+        A_applied, Bz = self.update_vector_potential(t)
+        J_boundary = self.update_mu_boundary(t)
+        eta, gamma = self.get_ferromagnetic(t)
+        s_applied = self.update_s_direction(t)
+        return StepFields(
+            A_applied=A_applied, Bz=Bz, J_boundary=J_boundary,
+            eta=eta, gamma=gamma, s_applied=s_applied,
+        )

@@ -9,13 +9,15 @@ Supports animation of spatial fields over time:
     - supercurrent: |Js| (modulus of supercurrent)
     - normal_current: |Jn| (modulus of normal current)
 
-Can create single-panel or multi-panel animations.
+Layouts:
+    - 1 quantity: single panel
+    - 2-3 quantities: vertical stack (N × 1)
+    - 6 quantities: 2 × 3 grid (same layout as plot_summary)
 """
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-import h5py
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import matplotlib.animation as animation
@@ -28,136 +30,79 @@ from .solution import Solution
 # QUANTITY CONFIGURATION
 # ============================================================================
 
-# Mapping from quantity name to (title, colorbar label, cmap, vmin, vmax)
 QUANTITY_CONFIG: Dict[str, Dict] = {
     'order_parameter': {
         'title': r'$|\psi|$',
         'label': r'$|\psi|$',
         'cmap': 'viridis',
-        'vmin': 0.0,
-        'vmax': 1.0,
+        'vmin': 0.0, 'vmax': 1.0,
     },
     'psi': {
         'title': r'$|\psi|$',
         'label': r'$|\psi|$',
         'cmap': 'viridis',
-        'vmin': 0.0,
-        'vmax': 1.0,
+        'vmin': 0.0, 'vmax': 1.0,
     },
     'phase': {
         'title': r'Phase $\theta/\pi$',
         'label': r'$\theta/\pi$',
         'cmap': 'twilight_shifted',
-        'vmin': -1.0,
-        'vmax': 1.0,
+        'vmin': -1.0, 'vmax': 1.0,
     },
     'mu': {
-        'title': r'Scalar potential $\mu$',
+        'title': r'$\mu$',
         'label': r'$\mu$',
         'cmap': 'magma',
-        'vmin': None,  # auto
-        'vmax': None,  # auto
+        'vmin': None, 'vmax': None,
     },
     'div_Js': {
         'title': r'$\nabla \cdot J_s$',
         'label': r'$\nabla \cdot J_s$',
         'cmap': 'RdBu_r',
-        'vmin': None,  # auto (symmetric)
-        'vmax': None,  # auto (symmetric)
+        'vmin': None, 'vmax': None,
     },
     'supercurrent': {
         'title': r'$|J_s|$',
         'label': r'$|J_s|$',
         'cmap': 'inferno',
-        'vmin': 0.0,
-        'vmax': None,  # auto
+        'vmin': 0.0, 'vmax': None,
     },
     'normal_current': {
         'title': r'$|J_n|$',
         'label': r'$|J_n|$',
         'cmap': 'plasma',
-        'vmin': 0.0,
-        'vmax': None,  # auto
+        'vmin': 0.0, 'vmax': None,
     },
 }
 
 
 def _extract_quantity(step_data: Dict[str, np.ndarray], quantity: str) -> np.ndarray:
-    """
-    Extract the spatial field for a given quantity from step data.
-
-    Args:
-        step_data: Dictionary with keys like 'psi', 'mu', 'supercurrent_x', etc.
-        quantity: Name of the quantity to extract.
-
-    Returns:
-        1D numpy array of values at each mesh site.
-
-    Raises:
-        ValueError: If quantity is unknown or data is missing.
-    """
+    """Extract the spatial field for a given quantity from step data."""
     if quantity in ['order_parameter', 'psi']:
-        if 'psi' not in step_data:
-            raise ValueError("Missing 'psi' in step data")
         return np.abs(step_data['psi'])
-
     elif quantity == 'phase':
-        if 'psi' not in step_data:
-            raise ValueError("Missing 'psi' in step data")
         return np.angle(step_data['psi']) / np.pi
-
     elif quantity == 'mu':
-        if 'mu' not in step_data:
-            raise ValueError("Missing 'mu' in step data")
         return step_data['mu']
-
     elif quantity == 'div_Js':
-        if 'div_Js' not in step_data:
-            raise ValueError("Missing 'div_Js' in step data")
         return np.real(step_data['div_Js'])
-
     elif quantity == 'supercurrent':
-        if 'supercurrent_x' not in step_data or 'supercurrent_y' not in step_data:
-            raise ValueError("Missing supercurrent components in step data")
-        Jx = step_data['supercurrent_x']
-        Jy = step_data['supercurrent_y']
+        Jx, Jy = step_data['supercurrent_x'], step_data['supercurrent_y']
         return np.sqrt(Jx ** 2 + Jy ** 2)
-
     elif quantity == 'normal_current':
-        if 'normal_current' not in step_data:
-            raise ValueError("Missing 'normal_current' in step data")
         nc = step_data['normal_current']
         return np.sqrt(nc[:, 0] ** 2 + nc[:, 1] ** 2)
-
     else:
-        raise ValueError(
-            f"Unknown quantity: {quantity!r}. "
-            f"Available: {list(QUANTITY_CONFIG.keys())}"
-        )
+        raise ValueError(f"Unknown quantity: {quantity!r}. Available: {list(QUANTITY_CONFIG.keys())}")
 
 
-def _compute_auto_range(
-    solution: Solution,
-    quantity: str,
-    steps: List[int],
-) -> Tuple[float, float]:
-    """
-    Compute automatic vmin/vmax for a quantity by scanning all frames.
-
-    For symmetric quantities (div_Js), uses symmetric range [-max, max].
-    For positive quantities (|ψ|, |Js|, |Jn|), uses [0, max].
-    For signed quantities (mu), uses [min, max].
-    """
+def _compute_auto_range(solution: Solution, quantity: str, steps: List[int]) -> Tuple[float, float]:
+    """Compute automatic vmin/vmax by scanning all frames."""
     config = QUANTITY_CONFIG[quantity]
-
-    # If both are fixed, return them
     if config['vmin'] is not None and config['vmax'] is not None:
         return config['vmin'], config['vmax']
 
-    # Scan all frames to find min/max
-    global_min = np.inf
-    global_max = -np.inf
-
+    global_min, global_max = np.inf, -np.inf
     for step in steps:
         data = solution.get_spatial_data(step=step)
         values = _extract_quantity(data, quantity)
@@ -167,16 +112,13 @@ def _compute_auto_range(
         global_min = min(global_min, float(np.min(values)))
         global_max = max(global_max, float(np.max(values)))
 
-    # Apply fixed bounds from config
     vmin = config['vmin'] if config['vmin'] is not None else global_min
     vmax = config['vmax'] if config['vmax'] is not None else global_max
 
-    # For symmetric quantities, make range symmetric
     if quantity == 'div_Js':
         abs_max = max(abs(global_min), abs(global_max))
         vmin, vmax = -abs_max, abs_max
 
-    # Safety margin (5%)
     if config['vmin'] is None and config['vmax'] is None:
         span = vmax - vmin
         if span > 0:
@@ -184,6 +126,25 @@ def _compute_auto_range(
             vmax += 0.05 * span
 
     return vmin, vmax
+
+
+def _hide_inner_axes(axes, nrows: int, ncols: int) -> None:
+    """
+    Hide axis labels on inner panels for cleaner multi-panel figures.
+
+    Rules:
+        - Y-axis labels only on the leftmost column (j == 0)
+        - X-axis labels only on the bottom row (i == nrows - 1)
+    """
+    for i in range(nrows):
+        for j in range(ncols):
+            ax = axes[i, j] if nrows > 1 or ncols > 1 else axes
+            if j != 0:
+                ax.set_ylabel('')
+                ax.tick_params(labelleft=False)
+            if i != nrows - 1:
+                ax.set_xlabel('')
+                ax.tick_params(labelbottom=False)
 
 
 # ============================================================================
@@ -205,61 +166,38 @@ def make_video_from_solution(
     """
     Create a GIF animation of spatial fields over time.
 
-    Supports single-panel or multi-panel animations. For multi-panel,
-    quantities are arranged in a grid (1 column, N rows).
+    Layouts:
+        - 1 quantity: single panel
+        - 2-3 quantities: vertical stack (N × 1)
+        - 6 quantities: 2 × 3 grid (same as plot_summary)
+            Row 0: |ψ|, phase(ψ), μ
+            Row 1: div(Js), |Js|, |Jn|
 
     Args:
         solution: Solution object with simulation results.
         fig_name: Output file name (without extension).
         file_dir: Directory to save the animation.
         quantities: Quantity name or list of names.
-            Available: 'order_parameter', 'phase', 'mu', 'div_Js',
-            'supercurrent', 'normal_current'.
         fps: Frames per second.
         figsize: Figure size (width, height). If None, auto-calculated.
         dpi: Resolution.
-        vmin: Color scale minimum. Can be:
-            - None: use default from QUANTITY_CONFIG
-            - float: fixed value (for single quantity)
-            - list of floats: one per quantity (for multi-panel)
-            - 'auto': scan all frames to find min
-        vmax: Color scale maximum (same options as vmin).
+        vmin, vmax: Color scale bounds (None = auto, float = fixed).
         steps: List of step indices to animate. If None, uses all saved steps.
 
     Returns:
         Path to the created GIF file, or None if animation failed.
-
-    Examples:
-        >>> # Single quantity
-        >>> make_video_from_solution(sol, "energy", "./", quantities="order_parameter")
-
-        >>> # Multiple quantities in one video
-        >>> make_video_from_solution(sol, "overview", "./",
-        ...     quantities=["order_parameter", "phase", "mu"])
-
-        >>> # Custom range
-        >>> make_video_from_solution(sol, "mu", "./", quantities="mu",
-        ...     vmin=-1.0, vmax=1.0)
     """
-    # Normalize quantities to list
     if isinstance(quantities, str):
         quantities = [quantities]
 
     n_quantities = len(quantities)
-
-    # Validate quantities
     for q in quantities:
         if q not in QUANTITY_CONFIG:
-            raise ValueError(
-                f"Unknown quantity: {q!r}. "
-                f"Available: {list(QUANTITY_CONFIG.keys())}"
-            )
+            raise ValueError(f"Unknown quantity: {q!r}. Available: {list(QUANTITY_CONFIG.keys())}")
 
-    # Create output directory
     Path(file_dir).mkdir(parents=True, exist_ok=True)
     output_path = os.path.join(file_dir, f"{fig_name}.gif")
 
-    # Get step list
     if steps is None:
         steps = solution._saved_steps
 
@@ -268,18 +206,28 @@ def make_video_from_solution(
         print(f"⚠️ Not enough frames for animation (n_frames={n_frames})")
         return None
 
+    # Determine grid layout
+    if n_quantities == 1:
+        nrows, ncols = 1, 1
+    elif n_quantities <= 3:
+        nrows, ncols = n_quantities, 1
+    elif n_quantities == 6:
+        nrows, ncols = 2, 3
+    else:
+        raise ValueError(f"Unsupported number of quantities: {n_quantities}. Use 1, 2, 3, or 6.")
+
     # Auto-calculate figsize if not provided
     if figsize is None:
         if n_quantities == 1:
             figsize = (8, 6)
-        else:
+        elif n_quantities <= 3:
             figsize = (8, 4 * n_quantities)
+        else:  # 6 quantities
+            figsize = (14, 10)
 
     # Compute vmin/vmax for each quantity
-    vmin_list = []
-    vmax_list = []
+    vmin_list, vmax_list = [], []
     for i, q in enumerate(quantities):
-        # Handle user-provided vmin/vmax
         user_vmin = vmin if isinstance(vmin, (int, float)) or vmin is None else (
             vmin[i] if isinstance(vmin, list) and i < len(vmin) else None
         )
@@ -291,15 +239,16 @@ def make_video_from_solution(
             vmin_list.append(user_vmin)
             vmax_list.append(user_vmax)
         else:
-            # Auto-compute
             auto_vmin, auto_vmax = _compute_auto_range(solution, q, steps)
             vmin_list.append(user_vmin if user_vmin is not None else auto_vmin)
             vmax_list.append(user_vmax if user_vmax is not None else auto_vmax)
 
     # Create figure and axes
-    fig, axes = plt.subplots(n_quantities, 1, figsize=figsize, dpi=dpi)
-    if n_quantities == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, dpi=dpi)
+    if nrows == 1 and ncols == 1:
+        axes = np.array([[axes]])
+    elif nrows == 1 or ncols == 1:
+        axes = axes.reshape(nrows, ncols)
 
     # Setup triangulation
     x = solution.sites[:, 0]
@@ -308,41 +257,45 @@ def make_video_from_solution(
 
     # Initialize plots
     ims = []
-    cbars = []
-    for i, (ax, q) in enumerate(zip(axes, quantities)):
-        config = QUANTITY_CONFIG[q]
-        ax.set_aspect('equal')
-        ax.set_xlabel('x [ξ]')
-        ax.set_ylabel('y [ξ]')
-        ax.set_xlim(x.min(), x.max())
-        ax.set_ylim(y.min(), y.max())
+    for i in range(nrows):
+        for j in range(ncols):
+            idx = i * ncols + j
+            if idx < n_quantities:
+                ax = axes[i, j]
+                config = QUANTITY_CONFIG[quantities[idx]]
+                ax.set_aspect('equal')
+                ax.set_xlabel('x [ξ]')
+                ax.set_ylabel('y [ξ]')
+                ax.set_xlim(x.min(), x.max())
+                ax.set_ylim(y.min(), y.max())
+                ax.set_title(config['title'])
 
-        # Initial empty plot
-        im = ax.tripcolor(
-            triangulation, np.zeros(len(x)),
-            cmap=config['cmap'],
-            vmin=vmin_list[i], vmax=vmax_list[i],
-            shading='gouraud',
-        )
-        ims.append(im)
-        cbar = fig.colorbar(im, ax=ax)
-        cbar.set_label(config['label'])
-        cbars.append(cbar)
+                im = ax.tripcolor(
+                    triangulation, np.zeros(len(x)),
+                    cmap=config['cmap'],
+                    vmin=vmin_list[idx], vmax=vmax_list[idx],
+                    shading='gouraud',
+                )
+                ims.append(im)
+                fig.colorbar(im, ax=ax, label=config['label'])
 
-    # Title (shared)
+    # Hide inner axes
+    _hide_inner_axes(axes, nrows, ncols)
+
+    # Shared title with time info
     title = fig.suptitle('')
 
     def update(frame_idx):
         """Update all panels for one frame."""
         step = steps[frame_idx]
         data = solution.get_spatial_data(step=step)
-        time = data.get('time', frame_idx)
+        time_val = data.get('time', frame_idx)
 
-        for i, (im, q) in enumerate(zip(ims, quantities)):
-            values = _extract_quantity(data, q)
+        for idx, im in enumerate(ims):
+            values = _extract_quantity(data, quantities[idx])
             im.set_array(values)
 
-        title.set_text(f't = {time:.3f} τ₀  (step {step})')
+        title.set_text(f't = {time_val:.3f} τ₀  (step {step})')
         return ims
 
     # Create animation

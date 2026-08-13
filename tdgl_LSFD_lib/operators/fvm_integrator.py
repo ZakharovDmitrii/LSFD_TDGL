@@ -355,20 +355,3 @@ class FVMIntegrator:
 
         return max_triangle_error, mean_triangle_error, max_voronoi_error, mean_voronoi_error
 
-
-    def Energy_conservation_check(self, psi: np.ndarray, psi_derivatives: np.ndarray, s_applied: np.ndarray,
-                          B:float, eta:float, gamma:float):
-
-        s_x, s_y = s_applied
-        sq_psi = psi * psi.conjugate()
-        sq_Dx_psi = psi_derivatives[:, 0] * psi_derivatives[:, 0].conjugate()
-        sq_Dy_psi = psi_derivatives[:, 1] * psi_derivatives[:, 1].conjugate()
-        s_grad_psi = (s_x * (psi_derivatives[:, 0] + psi_derivatives[:, 0].conjugate())
-                    + s_y * (psi_derivatives[:, 1] + psi_derivatives[:, 1].conjugate()))
-
-        F = - sq_psi + 0.5 * sq_psi**2 + sq_Dx_psi + sq_Dy_psi + eta * s_grad_psi + B**2
-
-        F_voronoi = self.compute_divergence_integral(F, method='voronoi')
-        F_triangles  = self.compute_divergence_integral(F, method='triangles')
-
-        return F_voronoi, F_triangles

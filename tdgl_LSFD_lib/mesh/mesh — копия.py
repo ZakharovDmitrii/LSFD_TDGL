@@ -27,6 +27,13 @@ class LSFDNeighbors:
     coords: np.ndarray  # (N, K, 2)
     distances: np.ndarray  # (N, K)
     lsfd_edge_vectors: np.ndarray # (N, K, 2)
+    indices_with_ghosts: np.ndarray
+    coords_with_ghosts: np.ndarray
+    distances_with_ghosts: np.ndarray
+    lsfd_edge_vectors_with_ghosts: np.ndarray
+    ghost_dist: float
+    ghost_coords: np.ndarray
+    indices_of_own_ghost_point_in_sites_with_ghosts: np.ndarray
 
 class Mesh:
     def __init__(
@@ -39,6 +46,7 @@ class Mesh:
             dual_mesh: Optional[DualMesh] = None,
             lsfd_neighbors: Optional[LSFDNeighbors] = None,
             n_lsfd_neighbors: int = 15,
+            ghost_coeff: float = 1,
     ):
         self.sites = np.asarray(sites, dtype=np.float64).squeeze()
         self.elements = np.asarray(elements, dtype=np.int64).squeeze()
@@ -48,7 +56,7 @@ class Mesh:
         self.dual_mesh = dual_mesh
         self.lsfd_neighbors = lsfd_neighbors
         self.n_lsfd_neighbors = n_lsfd_neighbors
-
+        self.ghost_coeff = ghost_coeff
 
         self._center_of_mass: Optional[Tuple[float, float]] = None
 
@@ -265,7 +273,7 @@ class Mesh:
         tri_mesh.edges_to_tri = np.array(tri_grp["edges_to_tri"], dtype=np.int64)
         tri_mesh.tri_edge_normals = np.array(tri_grp["tri_edge_normals"])
         tri_mesh.boundary_site_normals = np.array(tri_grp["boundary_site_normals"])
-        tri_mesh.boundary_vertex_indices = np.array(tri_grp["boundary_vertex_indices"])  # ← ДОБАВИТЬ!
+        tri_mesh.boundary_site_indices = np.array(tri_grp["boundary_site_indices"])  # ← ДОБАВИТЬ!
         # Пересчитываем normalized_edge_directions
         tri_mesh.normalized_edge_directions = tri_mesh.edge_directions / tri_mesh.edge_lengths[:, np.newaxis]
 
@@ -324,6 +332,7 @@ class Mesh:
             sites: Sequence[Tuple[float, float]],
             elements: Sequence[Tuple[int, int, int]],
             n_lsfd_neighbors: int = 15,  # ← глобальный параметр
+            ghost_coeff: float = 1.0,
     ) -> "Mesh":
         """
         Создать Mesh из триангуляции.
@@ -357,16 +366,46 @@ class Mesh:
         indices = indices[:, 1:]
         coords = sites[indices] - sites[:, np.newaxis, :]
 
+        lsfd_edge_vectors = coords   # (N, K, 2)
 
-        r_i = sites[:, None, :]  # (N, 1, 2)
-        r_j = sites[indices]  # (N, K, 2)
-        lsfd_edge_vectors = r_j - r_i  # (N, K, 2)
+        # ==== 5. LSFD Neighbors with ghost points ===
+
+        n_dist = ghost_coeff #np.mean(tri_mesh.edge_lengths[tri_mesh.boundary_edge_indices])
+
+        ghost_coords = sites[boundary_indices] + tri_mesh.boundary_site_normals * n_dist
+
+        sites_with_ghosts = np.concatenate([ghost_coords, sites]) # (N+G, 2)
+        kdtree_with_ghosts = KDTree(sites_with_ghosts)
+        distances_with_ghosts, indices_with_ghosts = kdtree_with_ghosts.query(sites_with_ghosts, k=n_lsfd_neighbors + 1) # (N+G, K+1)
+
+        distances_with_ghosts = distances_with_ghosts[len(ghost_coords):] # (N, K+1)
+        distances_with_ghosts = distances_with_ghosts[:, 1:] # (N, K)
+
+        indices_with_ghosts = indices_with_ghosts[len(ghost_coords):] # (N, K+1)
+        indices_with_ghosts = indices_with_ghosts[:, 1:] # (N, K)
+
+        coords_with_ghosts = sites_with_ghosts[indices_with_ghosts] - sites[:, np.newaxis, :]
+
+        lsfd_edge_vectors_with_ghosts = coords_with_ghosts  # (N, K, 2)
+
+        I = indices_with_ghosts[boundary_indices]  # (N_bnd, K)
+
+        # Векторизованный поиск: для каждой строки j ищем столбец, где значение == j
+        indices_of_own_ghost_point_in_sites_with_ghosts = np.argmax(I == np.arange(len(boundary_indices))[:, None], axis=1)
+
 
         lsfd_neighbors = LSFDNeighbors(
             indices=indices,
             coords=coords,
             distances=distances,
             lsfd_edge_vectors = lsfd_edge_vectors,
+            indices_with_ghosts = indices_with_ghosts,
+            coords_with_ghosts=coords_with_ghosts,
+            distances_with_ghosts=distances_with_ghosts,
+            lsfd_edge_vectors_with_ghosts = lsfd_edge_vectors_with_ghosts,
+            ghost_dist = n_dist,
+            ghost_coords = ghost_coords,
+            indices_of_own_ghost_point_in_sites_with_ghosts = indices_of_own_ghost_point_in_sites_with_ghosts,
         )
 
 

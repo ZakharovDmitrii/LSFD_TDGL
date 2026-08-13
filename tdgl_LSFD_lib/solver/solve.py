@@ -43,15 +43,9 @@ from .solver import TDGLSolver
 logger = logging.getLogger(__name__)
 
 
-def solve(
-    device: Device,
-    operators: LSFD_operators,
-    external_fields: ExternalFields,
-    options: SolverOptions,
-    psi_init: Optional[np.ndarray] = None,
-    mu_init: Optional[np.ndarray] = None,
-    seed_solution: Optional[str] = None,
-) -> Solution:
+def solve(device, operators, external_fields, options,
+          psi_init=None, mu_init=None, seed_solution=None,
+          reset_clock: bool = True) -> Solution:
     """
     Run a TDGL simulation.
 
@@ -133,12 +127,10 @@ def solve(
     runner = TDGLRunner(solver=solver, options=options)
 
     result_info = runner.run(
-        psi_init=psi_init,
-        mu_init=mu_init,
+        psi_init=psi_init, mu_init=mu_init,
         seed_solution=seed_solution,
+        reset_clock=reset_clock,          # ← пробросить
     )
-
-    # 6. Return Solution object for post-processing
     return Solution(path=result_info['output_path'])
 
 
