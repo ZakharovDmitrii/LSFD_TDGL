@@ -101,10 +101,18 @@ class TDGLSolver:
         self.operators._use_sparse_delta = False
         print('Sparce', self.operators._use_sparse_delta)
 
+
+
+        self.A_for_mirror_sites = None
+        print(operators.use_mirror_points)
+        if operators.use_mirror_points:
+            self.A_for_mirror_sites = self.external_fields.calculate_fixed_applied_vector_potential(
+            x=operators.mirror_intersec[:, 0], y=operators.mirror_intersec[:, 1]
+            )
+
         self.A_for_constant_Bz = self.external_fields.calculate_fixed_applied_vector_potential(
             x=mesh.sites[:, 0], y=mesh.sites[:, 1]
         )
-
 
         # === TERMINALS ===
         if device.terminals:
@@ -121,6 +129,7 @@ class TDGLSolver:
                 total_source_lenght=self.total_source_lenght,
                 total_drain_lenght=self.total_drain_lenght,
             )
+            print('Размеры терминалов: ', self.total_source_lenght, self.total_drain_lenght)
         else:
             self.total_source_lenght = 0.0
             self.total_drain_lenght = 0.0
@@ -156,7 +165,8 @@ class TDGLSolver:
                                 Bz: float, psi_derivatives: np.ndarray = None):
         """Вычисляет все производные psi через LSFD."""
         delta_psi = self.operators.compute_delta_psi(
-            psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz, psi_derivatives = psi_derivatives
+            psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz, psi_derivatives = psi_derivatives,
+            A_at_intersec = self.A_for_mirror_sites,
         )
         psi_derivatives = self.operators._batched_dot(
             self.operators.G_matrix_psi_gamma, delta_psi
@@ -373,7 +383,7 @@ class TDGLSolver:
         gamma = fields.gamma
         Bz = fields.Bz
 
-        #A_applied = A_applied - 0.5 * self.s_applied # gauge_test!!!!!!!!
+       # A_applied = A_applied - 0.5 * self.s_applied # gauge_test!!!!!!!!
 
         # Обновление G при вращении s (если нужно)
         if gamma != 0:

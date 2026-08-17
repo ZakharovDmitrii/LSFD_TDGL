@@ -85,6 +85,7 @@ class Device:
             lloyd_step: float = 0.5,
             lloyd_tol: float = 1e-3,
             ghost_coeff: float = 1,
+            layers: int = 1,
             **meshpy_kwargs,
     ) -> None:
         """Сгенерировать сетку и найти терминалы.
@@ -116,6 +117,7 @@ class Device:
                 sites=points, elements=triangles,
                 boundary_indices=Mesh._find_boundary_indices(triangles),
                 n_lsfd_neighbors=n_lsfd_neighbors, ghost_coeff=ghost_coeff,
+                mirror_layers=layers,  # ← ДОБАВИТЬ
             )
 
             if graded_smooth:
@@ -141,6 +143,7 @@ class Device:
             triangles,
             n_lsfd_neighbors=n_lsfd_neighbors,
             ghost_coeff=ghost_coeff,
+            layers = layers,
         )
 
         # 4. Находим терминалы
@@ -643,7 +646,11 @@ class Device:
                 self.mesh.to_hdf5(f.create_group('mesh'), compress=compress)
 
     @classmethod
-    def load(cls, filepath: str, load_mesh: bool = True) -> "Device":
+    def load(cls, filepath: str, load_mesh: bool = True,
+             n_lsfd_neighbors: Optional[int] = None,
+             ghost_coeff: Optional[float] = None,
+             layers: Optional[int] = None,
+             build_mirror: bool = True) -> "Device":  # ← ДОБАВИТЬ ПАРАМЕТРЫ
         """Загрузить устройство из HDF5."""
         filepath = Path(filepath)
 
@@ -675,7 +682,12 @@ class Device:
             )
 
             if load_mesh and 'mesh' in f:
-                device.mesh = Mesh.from_hdf5(f['mesh'])
+                device.mesh = Mesh.from_hdf5(
+                    f['mesh'],
+                    n_lsfd_neighbors=n_lsfd_neighbors,
+                    ghost_coeff=ghost_coeff,
+                    layers=layers,
+                    build_mirror=build_mirror)  # ← ПЕРЕДАТЬ ПАРАМЕТРЫ
                 device._compute_terminal_data()
 
             return device

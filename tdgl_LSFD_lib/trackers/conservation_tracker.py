@@ -224,7 +224,7 @@ class ConservationTracker(SimulationTracker):
 
         F_density = (
             -sq_psi + 0.5 * sq_psi ** 2 + (sq_Dx + sq_Dy)
-            + 2 * result.eta * np.real(s_grad_psi)
+            + 2 * 0.5 * np.real(s_grad_psi) #  result.eta
             + result.Bz ** 2
         )
 

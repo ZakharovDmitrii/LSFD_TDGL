@@ -3,6 +3,8 @@ from typing import Callable, Tuple, Union
 import time
 import numpy as np
 import scipy.sparse as sp
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
 
 from tdgl_LSFD_lib.mesh.mesh import Mesh
 
@@ -355,3 +357,164 @@ class FVMIntegrator:
 
         return max_triangle_error, mean_triangle_error, max_voronoi_error, mean_voronoi_error
 
+    def plot_conservation_maps(self, J_x: np.ndarray, J_y: np.ndarray, div_J: np.ndarray,
+                               title_prefix: str = "Current",
+                               save_path: str = "conservation_maps.png",
+                               dpi: int = 200) -> str:
+        """
+        Карты локального сохранения (треугольники + Вороной) + короткая справка.
+        График сохраняется в save_path, plt.show() не вызывается.
+        """
+        # ---------- величины ----------
+        tri_flux = self.compute_triangle_flux(J_x, J_y)
+        div_tri = (1 / 3) * np.sum(div_J[self.triangles], axis=1) * self.tri_areas
+
+        voronoi_flux = self.compute_voronoi_flux(J_x, J_y)
+        div_vor = div_J * self.voronoi_areas
+
+        # флаги "граничный или нет"
+        tri_is_bnd = np.any(np.isin(self.tri_to_edges, self.boundary_edge_indices), axis=1)
+        site_is_bnd = np.isin(np.arange(len(self.sites)), self.boundary_indices)
+
+        # центр круглой области
+        cx, cy = np.mean(self.sites[:, 0]), np.mean(self.sites[:, 1])
+
+        # ---------- граничные потоки через рёбра ----------
+        b_edges = self.boundary_edges
+        Jx0, Jx1 = J_x[b_edges[:, 0]], J_x[b_edges[:, 1]]
+        Jy0, Jy1 = J_y[b_edges[:, 0]], J_y[b_edges[:, 1]]
+        J_dot_n_e = 0.5 * ((Jx0 + Jx1) * self.boundary_edge_normals[:, 0] +
+                           (Jy0 + Jy1) * self.boundary_edge_normals[:, 1])
+        flux_edges = J_dot_n_e * self.edge_lengths[self.boundary_edge_indices]
+        mid_x = 0.5 * (self.sites[b_edges[:, 0], 0] + self.sites[b_edges[:, 1], 0])
+        mid_y = 0.5 * (self.sites[b_edges[:, 0], 1] + self.sites[b_edges[:, 1], 1])
+        ang_e = np.degrees(np.arctan2(mid_y - cy, mid_x - cx))
+        sort_e = np.argsort(ang_e)
+
+        # ---------- граничные потоки в вершинах ----------
+        b_idx = self.boundary_indices
+        J_dot_n_s = (J_x[b_idx] * self.boundary_site_normals[:, 0] +
+                     J_y[b_idx] * self.boundary_site_normals[:, 1])
+        flux_sites = J_dot_n_s * self.boundary_sites_weights
+        ang_s = np.degrees(np.arctan2(self.sites[b_idx, 1] - cy, self.sites[b_idx, 0] - cx))
+        sort_s = np.argsort(ang_s)
+
+        # ---------- КОРОТКАЯ СПРАВКА ----------
+        lines = [f"=== Conservation summary: {title_prefix} ==="]
+
+
+
+        i = int(np.argmax(np.abs(tri_flux)))
+        lines.append(f"max |flux| triangle    = {tri_flux[i]:.6e} | centroid "
+                     f"({self.tri_centroids[i, 0]:.3f}, {self.tri_centroids[i, 1]:.3f}) | "
+                     f"boundary: {bool(tri_is_bnd[i])}")
+
+        i = int(np.argmax(np.abs(div_tri)))
+        lines.append(f"max |div int| triangle = {div_tri[i]:.6e} | centroid "
+                     f"({self.tri_centroids[i, 0]:.3f}, {self.tri_centroids[i, 1]:.3f}) | "
+                     f"boundary: {bool(tri_is_bnd[i])}")
+
+        i = int(np.argmax(np.abs(voronoi_flux)))
+        lines.append(f"max |flux| voronoi     = {voronoi_flux[i]:.6e} | site "
+                     f"({self.sites[i, 0]:.3f}, {self.sites[i, 1]:.3f}) | "
+                     f"boundary: {bool(site_is_bnd[i])}")
+
+        i = int(np.argmax(np.abs(div_vor)))
+        lines.append(f"max |div int| voronoi  = {div_vor[i]:.6e} | site "
+                     f"({self.sites[i, 0]:.3f}, {self.sites[i, 1]:.3f}) | "
+                     f"boundary: {bool(site_is_bnd[i])}")
+
+        i = int(np.argmax(np.abs(flux_edges)))
+        lines.append(f"max |flux| bnd edge    = {flux_edges[i]:.6e} | angle {ang_e[i]:.2f} deg")
+
+        i = int(np.argmax(np.abs(flux_sites)))
+        lines.append(f"max |flux| bnd site    = {flux_sites[i]:.6e} | angle {ang_s[i]:.2f} deg")
+
+        # ---------- СУММЫ: проверка глобальной теоремы Гаусса ----------
+        tot_tri_flux = float(np.sum(tri_flux))
+        tot_tri_div = float(np.sum(div_tri))
+        tot_vor_flux = float(np.sum(voronoi_flux))
+        tot_vor_div = float(np.sum(div_vor))
+        tot_bnd_edge = float(np.sum(flux_edges))
+        tot_bnd_site = float(np.sum(flux_sites))
+
+        lines.append("--- totals (global divergence theorem) ---")
+        # Телескопические тождества кода (должны совпадать до машинной точности):
+        lines.append(f"sum tri flux = {tot_tri_flux:+.6e} | sum bnd edge = {tot_bnd_edge:+.6e} "
+                     f"| diff = {tot_tri_flux - tot_bnd_edge:.2e}")
+        lines.append(f"sum vor flux = {tot_vor_flux:+.6e} | sum bnd site = {tot_bnd_site:+.6e} "
+                     f"| diff = {tot_vor_flux - tot_bnd_site:.2e}")
+        # Сама теорема Гаусса (расхождение = ошибка консервативности схемы):
+        lines.append(f"sum tri div int = {tot_tri_div:+.6e} | minus sum tri flux = {tot_tri_div - tot_tri_flux:+.6e}")
+        lines.append(f"sum vor div int = {tot_vor_div:+.6e} | minus sum vor flux = {tot_vor_div - tot_vor_flux:+.6e}")
+        # Локализация ошибки: граница против внутренности
+        lines.append(f"sum div int: bnd tris = {np.sum(div_tri[tri_is_bnd]):+.6e} | "
+                     f"int tris = {np.sum(div_tri[~tri_is_bnd]):+.6e}")
+
+        summary = "\n".join(lines)
+        print(summary)
+
+        # ---------- ГРАФИК (сохранение, без show) ----------
+        fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+        fig.suptitle(f"Local Conservation Analysis: {title_prefix}", fontsize=16)
+
+        triang = mtri.Triangulation(self.sites[:, 0], self.sites[:, 1], self.triangles)
+
+        # ряд 1: треугольники
+        ax = axes[0, 0]
+        tpc1 = ax.tripcolor(triang, facecolors=tri_flux, edgecolors='k',
+                            linewidths=0.2, cmap='viridis')
+        fig.colorbar(tpc1, ax=ax)
+        ax.set_title("Flux through Triangles")
+        ax.set_aspect('equal')
+
+        ax = axes[0, 1]
+        tpc2 = ax.tripcolor(triang, facecolors=div_tri, edgecolors='k',
+                            linewidths=0.2, cmap='viridis')
+        fig.colorbar(tpc2, ax=ax)
+        ax.set_title("Div Integral over Triangles")
+        ax.set_aspect('equal')
+
+        ax = axes[0, 2]
+        ax.plot(ang_e[sort_e], flux_edges[sort_e], 'o-', markersize=4, label='Edge-based')
+        ax.plot(ang_s[sort_s], flux_sites[sort_s], 's--', markersize=4, label='Site-based')
+        ax.set_title("Boundary Flux vs Angle")
+        ax.set_xlabel("Angle (deg)")
+        ax.set_ylabel("Flux")
+        ax.legend()
+        ax.grid(True)
+
+        # ряд 2: Вороной
+        ax = axes[1, 0]
+        sc1 = ax.scatter(self.sites[:, 0], self.sites[:, 1], c=voronoi_flux,
+                         cmap='viridis', s=15, edgecolors='k', linewidths=0.2)
+        fig.colorbar(sc1, ax=ax)
+        ax.set_title("Flux through Voronoi Cells")
+        ax.set_aspect('equal')
+
+        ax = axes[1, 1]
+        sc2 = ax.scatter(self.sites[:, 0], self.sites[:, 1], c=div_vor,
+                         cmap='viridis', s=15, edgecolors='k', linewidths=0.2)
+        fig.colorbar(sc2, ax=ax)
+        ax.set_title("Div Integral over Voronoi Cells")
+        ax.set_aspect('equal')
+
+        ax = axes[1, 2]
+        vor_bnd = self.boundary_flux_from_cell[b_idx]
+        ax.plot(ang_s[sort_s], voronoi_flux[b_idx][sort_s], 'o-', markersize=4,
+                label='Voronoi Total Flux')
+        ax.plot(ang_s[sort_s], div_vor[b_idx][sort_s], 's--', markersize=4,
+                label='Voronoi Div Integral')
+        ax.plot(ang_s[sort_s], vor_bnd[sort_s], '^:', markersize=4,
+                label='Boundary Flux Only')
+        ax.set_title("Voronoi Boundary Sites")
+        ax.set_xlabel("Angle (deg)")
+        ax.set_ylabel("Flux / Integral")
+        ax.legend()
+        ax.grid(True)
+
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=dpi)
+        plt.close(fig)
+
+        return summary

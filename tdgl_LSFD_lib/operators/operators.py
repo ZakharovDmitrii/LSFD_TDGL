@@ -1,5 +1,3 @@
-from typing import Callable, Tuple, Union
-import time
 import numpy as np
 import scipy.sparse as sp
 from scipy.spatial import KDTree
@@ -16,6 +14,7 @@ class LSFD_operators:
             mesh: Mesh,
             s_direction: np.ndarray,
             use_ghost_points: bool = False,
+            use_mirror_points: bool = False,
             ghost_version: str = 'sym', # 'asym'
             check_condition_number: bool = False,  # ← НОВЫЙ ПАРАМЕТР
             weight_function: str = 'exp',
@@ -36,8 +35,34 @@ class LSFD_operators:
 
         self.use_ghost_points = use_ghost_points
         self.ghost_version = ghost_version
+        self.use_mirror_points = use_mirror_points
 
-        if self.use_ghost_points == True:
+        # self.use_mirror_points = bool(use_mirror_points) and \
+        #                          mesh.lsfd_neighbors.mirror_coords is not None
+        # assert not (self.use_mirror_points and use_ghost_points), \
+        #     "ghost и mirror — взаимно исключающие режимы"
+        self.n_ghosts = 0
+        self.n_mirrors = 0
+        if self.use_mirror_points:
+            nb = mesh.lsfd_neighbors
+            self.nb_indices = nb.indices_with_mirrors
+            self.nb_coords = nb.coords_with_mirrors
+            self.nb_dist = nb.distances_with_mirrors
+            self.nb_edge_vectors = nb.lsfd_edge_vectors_with_mirrors
+            self.nb_edge_vectors_flat = self.nb_edge_vectors.reshape(-1, 2)
+            self.mirror_coords, self.mirror_inner = nb.mirror_coords, nb.mirror_inner
+            self.mirror_intersec = nb.mirror_intersec
+            self.mirror_d = nb.d_vectors
+            self.mirror_edge_verts = nb.edge_verts
+            self.mirror_w_lin = nb.w_lin
+            self.mirror_normals = mesh.tri_mesh.boundary_edge_normals[nb.edge]  # (M,2)
+            self.mirror_d_len = np.linalg.norm(self.mirror_d, axis=1)
+            self.n_mirrors = len(self.mirror_coords)
+            self.A_for_mirror_sites = None   # заполняет solver (кэш A в точках intersec)
+
+            print('mirrors operators: ', len(self.mirror_d))
+
+        elif self.use_ghost_points:
             self.nb_indices = mesh.lsfd_neighbors.indices_with_ghosts  # (N, K) -> индексы в sites_with_ghosts
             self.nb_coords = mesh.lsfd_neighbors.coords_with_ghosts  # (N, K, 2)
             self.nb_dist = mesh.lsfd_neighbors.distances_with_ghosts
@@ -50,7 +75,7 @@ class LSFD_operators:
             self.n_ghosts = len(self.ghost_sites)
             self.ghost_dist = mesh.lsfd_neighbors.ghost_dist
             self.own_ghost_col_idx = mesh.lsfd_neighbors.indices_of_own_ghost_point_in_sites_with_ghosts
-            self.ghost_coords = mesh.lsfd_neighbors.ghost_coords - self.sites[self.boundary_indices] # (B,2)
+            self.ghost_coords = mesh.lsfd_neighbors.ghost_coords - self.sites[self.boundary_indices]  # (B,2)
         else:
             self.nb_indices = mesh.lsfd_neighbors.indices
             self.nb_coords = mesh.lsfd_neighbors.coords
@@ -438,6 +463,7 @@ class LSFD_operators:
         j_idx = self.nb_indices_psi.flatten()  # (N*K,)
 
         self.psi_i_idx = i_idx  # (N*K,)
+        print('длина индексов psi: ', len(self.psi_i_idx))
         self.psi_j_idx = j_idx  # (N*K,)
 
     def set_link_variables(self, A_applied: np.ndarray = None):
@@ -468,6 +494,28 @@ class LSFD_operators:
         self._U_link_cache = U_link
         self._A_cache = A_applied.copy()
         return U_link
+
+    # mirror implementation
+
+    def compute_mirror_values(self, psi: np.ndarray, s_applied: np.ndarray, eta: float,
+                              A_at_intersec: np.ndarray = None) -> np.ndarray:
+        """Значения psi в mirror-точках через правило отражения.
+        psi_g = U*(U*psi_inner + 2|d|*g_b),  U = exp(+i A_b·d),  g_b = (n·Dpsi)_b = -i*eta*(n·s)*psi_b.
+        psi_b восстанавливается линейно по концам ребра (обычный Тейлор, без линков)."""
+        A_b = A_at_intersec if A_at_intersec is not None else self.A_for_mirror_sites
+        if A_b is None:
+            raise RuntimeError("A_for_mirror_sites не задан: solver должен закэшировать A в точках intersec.")
+        w1, w2 = self.mirror_w_lin
+        v1, v2 = self.mirror_edge_verts[:, 0], self.mirror_edge_verts[:, 1]
+        psi_b = w1 * psi[v1] + w2 * psi[v2]                    # O(h^2), линки не нужны
+        s_x, s_y = s_applied[0], s_applied[1]
+
+        n_dot_s = self.mirror_normals[:, 0] * s_x + self.mirror_normals[:, 1] * s_y
+        A_dot_d = np.einsum('ij,ij->i', A_b, self.mirror_d)
+
+        U = np.cos(A_dot_d) + 1j * np.sin(A_dot_d)             # = U_bp = U_bg^{-1}
+        g_b = -1j * eta * n_dot_s * psi_b                      # то же (n·Dpsi), что в ghost
+        return U * (U * psi[self.mirror_inner] + 2.0 * self.mirror_d_len * g_b)
 
     def compute_ghost_values(self, psi: np.ndarray, A_applied: np.ndarray, s_applied: np.ndarray,
                           eta: float, psi_derivatives: np.ndarray = None):
@@ -501,7 +549,8 @@ class LSFD_operators:
         return psi_ghost
 
     def compute_delta_psi(self, psi: np.ndarray, A_applied: np.ndarray, s_applied: np.ndarray,
-                          eta: float, gamma: float, Bz: float, psi_derivatives: np.ndarray = None):
+                          eta: float, gamma: float, Bz: float, psi_derivatives: np.ndarray = None,
+                          A_at_intersec: np.ndarray = None):
         """
         Вычисляет разности psi с калибровочными фазами.
 
@@ -520,7 +569,18 @@ class LSFD_operators:
         s_x, s_y = s_applied[0], s_applied[1]
         n_dot_s = n_vec[:, 0] * s_x + n_vec[:, 1] * s_y
 
-        if self.use_ghost_points:
+        if self.use_mirror_points:
+            psi_mirror = self.compute_mirror_values(psi, s_applied, eta, A_at_intersec=A_at_intersec)
+            psi_ext = np.concatenate([psi_mirror, psi])
+            if self._use_sparse_delta == False:
+                psi_i = psi[self.psi_i_idx]
+                psi_j = psi_ext[self.psi_j_idx]
+                U_link = self.set_link_variables(A_applied)
+                delta_psi = U_link * psi_j - psi_i
+            else:
+                delta_psi = self.build_delta_matrix(A_applied) @ psi_ext
+
+        elif self.use_ghost_points:
             psi_ghost = self.compute_ghost_values(psi,A_applied, s_applied, eta, psi_derivatives)
             psi_ext = np.concatenate([psi_ghost, psi])
 
@@ -620,6 +680,15 @@ class LSFD_operators:
             rhs: (N, K) — правая часть для каждой точки и соседа
         """
         # Основное заполнение: mu[neighbor_j]
+
+        if self.use_mirror_points:
+            w1, w2 = self.mirror_w_lin
+            v1, v2 = self.mirror_edge_verts[:, 0], self.mirror_edge_verts[:, 1]
+            I_full = np.zeros(self.n_sites, dtype=mu_guess.dtype)
+            I_full[self.boundary_indices] = I_boundary
+            I_b = w1 * I_full[v1] + w2 * I_full[v2]            # (n·∇mu)_b интерполируем с ребра
+            mu_mirror = mu_guess[self.mirror_inner] + 2.0 * self.mirror_d_len * I_b
+            mu_guess = np.concatenate([mu_mirror, mu_guess])
 
         if self.use_ghost_points:
 
@@ -1098,25 +1167,23 @@ class LSFD_operators:
 
         print(f"✅ Condition number report saved to: {filepath}")
 
-
     def analyze_boundary_stencil(
             self,
             K_list=(30, 50, 70, 100, 170),
             h_main: float = 0.5,
-            figsize=(16, 10),
+            figsize=(18, 12),
             save=None,
     ):
         """
-        Анализ структуры стенсила на граничных точках для разных K.
+        Расширенный анализ структуры стенсила на граничных точках для разных K.
 
         Для каждого K (не больше сохранённого n_lsfd_neighbors) вычисляет:
-          - domain radius d0 = расстояние до K-го соседа (vs координата θ и vs K);
-          - число соседей-граничных (n_bnd) и соседей-внутренних (n_int);
-          - число "основных" точек (dist < h_main): всего / граничных / внутренних.
-
-        Цель — понять, почему меньшее K улучшает границу: при большом K стенсил
-        перенасыщается тангенциальными граничными точками, а нормальная
-        (внутренняя) информация почти не прибавляется → растёт анизотропия фита.
+          - domain radius d0 = расстояние до K-го соседа (vs θ и vs K);
+          - доли соседей: граничные / внутренние / внешние (mirror или ghost);
+          - радиусы domain внутрь (до дальнего внутреннего соседа) и наружу
+            (до дальнего mirror/ghost) — видно, образуется ли «кольцо»;
+          - число "основных" точек (dist < h_main): всего / граничных / внутренних / внешних;
+          - цветовая карта domain radius по ВСЕМ точкам области.
 
         Returns:
             results: dict[K -> dict массивов по граничным точкам]
@@ -1124,9 +1191,39 @@ class LSFD_operators:
         import matplotlib.pyplot as plt
 
         nb = self.mesh.lsfd_neighbors
-        idx_full = nb.indices      # (N, Kmax), отсортированы по расстоянию
-        dist_full = nb.distances   # (N, Kmax)
+
+        # ---------------- режим и исходные данные ----------------
+        has_mirror = getattr(self, 'use_mirror_points', False) and \
+                     getattr(nb, 'indices_with_mirrors', None) is not None
+        has_ghost = (not has_mirror) and getattr(self, 'use_ghost_points', False) and \
+                    getattr(nb, 'indices_with_ghosts', None) is not None
+
+        if has_mirror:
+            idx_full = nb.indices_with_mirrors
+            dist_full = nb.distances_with_mirrors
+            n_ext_pts = len(nb.mirror_coords)
+            mode = 'mirror'
+        elif has_ghost:
+            idx_full = nb.indices_with_ghosts
+            dist_full = nb.distances_with_ghosts
+            n_ext_pts = len(nb.ghost_coords)
+            mode = 'ghost'
+        else:
+            idx_full = nb.indices
+            dist_full = nb.distances
+            n_ext_pts = 0
+            mode = 'plain'
+
         Kmax = idx_full.shape[1]
+
+        # ---------------- нормализация K_list: clip до Kmax + дедупликация ----------------
+        K_list_eff = []
+        for K_req in K_list:
+            K_eff = int(min(K_req, Kmax))
+            if K_req > Kmax:
+                print(f"Warning: K={K_req} > Kmax={Kmax}, clipped to {Kmax}")
+            if K_eff not in K_list_eff:
+                K_list_eff.append(K_eff)
 
         is_bnd = np.zeros(self.n_sites, dtype=bool)
         is_bnd[self.boundary_indices] = True
@@ -1141,86 +1238,154 @@ class LSFD_operators:
         results = {}
         summary_rows = []
 
-        fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+        fig = plt.figure(figsize=figsize, constrained_layout=True)
+        gs = fig.add_gridspec(3, 3)
+        ax_d0 = fig.add_subplot(gs[0, 0])
+        ax_frac = fig.add_subplot(gs[0, 1])
+        ax_radii = fig.add_subplot(gs[0, 2])
+        ax_main = fig.add_subplot(gs[1, 0])
+        ax_main_int = fig.add_subplot(gs[1, 1])
+        ax_cbar = fig.add_subplot(gs[1, 2])
+        ax_all = fig.add_subplot(gs[2, :])
 
-        for K in K_list:
-            K = int(min(K, Kmax))
-            if K != K and K > Kmax:
-                print(f"Warning: K={K} > Kmax={Kmax}, clipped to {Kmax}")
-
+        for K in K_list_eff:
             dK = dist_full[b_sorted, :K]     # (Nb, K)
             iK = idx_full[b_sorted, :K]      # (Nb, K)
 
             domain_radius = dK[:, -1]
-            is_bnd_nb = is_bnd[iK]           # (Nb, K)
-            n_bnd = is_bnd_nb.sum(axis=1)
-            n_int = K - n_bnd
 
+            # ---------------- классификация соседей ----------------
+            if mode == 'plain':
+                is_ext_nb = np.zeros_like(iK, dtype=bool)
+                is_bnd_nb = is_bnd[iK]
+            else:
+                is_ext_nb = iK < n_ext_pts                       # mirror / ghost
+                real_idx = np.where(~is_ext_nb, iK - n_ext_pts, 0)
+                is_bnd_nb = np.where(~is_ext_nb, is_bnd[real_idx], False)
+
+            n_ext = is_ext_nb.sum(axis=1)
+            n_bnd = is_bnd_nb.sum(axis=1)
+            n_int = K - n_bnd - n_ext
+
+            # радиусы: внутрь (внутренние соседи) и наружу (внешние)
+            d_int = np.where(~is_ext_nb & ~is_bnd_nb, dK, 0.0)
+            d_ext = np.where(is_ext_nb, dK, 0.0)
+            r_interior = d_int.max(axis=1)
+            r_exterior = d_ext.max(axis=1)
+
+            # "основные" точки (dist < h_main)
             main_mask = dK < h_main
             n_main = main_mask.sum(axis=1)
             n_main_bnd = (main_mask & is_bnd_nb).sum(axis=1)
-            n_main_int = (main_mask & ~is_bnd_nb).sum(axis=1)
+            n_main_int = (main_mask & ~is_bnd_nb & ~is_ext_nb).sum(axis=1)
+            n_main_ext = (main_mask & is_ext_nb).sum(axis=1)
 
             results[K] = {
                 'theta': theta_sorted,
                 'domain_radius': domain_radius,
-                'n_bnd': n_bnd,
-                'n_int': n_int,
-                'n_main': n_main,
-                'n_main_bnd': n_main_bnd,
-                'n_main_int': n_main_int,
+                'n_bnd': n_bnd, 'n_int': n_int, 'n_ext': n_ext,
+                'r_interior': r_interior, 'r_exterior': r_exterior,
+                'n_main': n_main, 'n_main_bnd': n_main_bnd,
+                'n_main_int': n_main_int, 'n_main_ext': n_main_ext,
             }
 
             # 1) domain radius vs θ
-            axes[0, 0].plot(theta_sorted, domain_radius, '.-', ms=1.5, lw=0.6,
-                            label=f'K={K}')
-            # 2) доля граничных соседей среди K vs θ
-            axes[0, 1].plot(theta_sorted, n_bnd / K, '.-', ms=1.5, lw=0.6,
-                            label=f'K={K}')
-            # 4) внутренние "основные" точки vs θ (нормальная информация)
-            axes[1, 1].plot(theta_sorted, n_main_int, '.-', ms=1.5, lw=0.6,
-                            label=f'K={K}')
+            ax_d0.plot(theta_sorted, domain_radius, '.-', ms=1.5, lw=0.6, label=f'K={K}')
+            # 2) доли типов соседей vs θ
+            ax_frac.plot(theta_sorted, n_bnd / K, '.-', ms=1.5, lw=0.6, label=f'K={K} bnd')
+            ax_frac.plot(theta_sorted, n_int / K, '.-', ms=1.5, lw=0.6, label=f'K={K} int')
+            if mode != 'plain':
+                ax_frac.plot(theta_sorted, n_ext / K, '.-', ms=1.5, lw=0.6, label=f'K={K} ext')
+            # 3) радиусы внутрь/наружу vs θ
+            ax_radii.plot(theta_sorted, r_interior, '.-', ms=1.5, lw=0.6, label=f'K={K} int')
+            if mode != 'plain':
+                ax_radii.plot(theta_sorted, r_exterior, '.-', ms=1.5, lw=0.6, label=f'K={K} ext')
+            # внутренние "основные" точки vs θ
+            ax_main_int.plot(theta_sorted, n_main_int, '.-', ms=1.5, lw=0.6, label=f'K={K}')
 
             summary_rows.append((
                 K,
                 domain_radius.mean(), domain_radius.min(), domain_radius.max(),
-                n_bnd.mean(), n_int.mean(),
-                n_main.mean(), n_main_bnd.mean(), n_main_int.mean(),
+                n_bnd.mean(), n_int.mean(), n_ext.mean(),
+                r_interior.mean(), r_exterior.mean(),
+                n_main.mean(), n_main_bnd.mean(), n_main_int.mean(), n_main_ext.mean(),
             ))
 
-        axes[0, 0].set_title('domain radius $d_0$ vs θ')
-        axes[0, 0].set_ylabel('$d_0$ [ξ]')
-        axes[0, 0].grid(alpha=0.3); axes[0, 0].legend()
+        # ---------------- оформление панелей ----------------
+        ax_d0.set_title('domain radius $d_0$ vs θ')
+        ax_d0.set_ylabel('$d_0$ [ξ]')
+        ax_d0.grid(alpha=0.3); ax_d0.legend(fontsize=8)
 
-        axes[0, 1].set_title('доля граничных (тангенциальных) соседей среди K')
-        axes[0, 1].set_ylabel('$n_{bnd}/K$')
-        axes[0, 1].grid(alpha=0.3); axes[0, 1].legend()
+        ax_frac.set_title(f'доли типов соседей vs θ ({mode})')
+        ax_frac.set_ylabel('доля от K')
+        ax_frac.grid(alpha=0.3); ax_frac.legend(fontsize=8)
 
-        # 3) средние счётчики "основных" точек vs K
+        ax_radii.set_title('радиус domain: внутрь vs наружу')
+        ax_radii.set_ylabel('radius [ξ]')
+        ax_radii.grid(alpha=0.3); ax_radii.legend(fontsize=8)
+
         Ks = [r[0] for r in summary_rows]
-        axes[1, 0].plot(Ks, [r[6] for r in summary_rows], 'o-', label='main: всего (dist<h)')
-        axes[1, 0].plot(Ks, [r[7] for r in summary_rows], 's-', label='main: граничные')
-        axes[1, 0].plot(Ks, [r[8] for r in summary_rows], '^-', label='main: внутренние')
-        axes[1, 0].set_title('среднее число "основных" точек (dist < h)')
-        axes[1, 0].set_xlabel('K')
-        axes[1, 0].grid(alpha=0.3); axes[1, 0].legend()
+        ax_main.plot(Ks, [r[9] for r in summary_rows], 'o-', label='main: всего')
+        ax_main.plot(Ks, [r[10] for r in summary_rows], 's-', label='main: bnd')
+        ax_main.plot(Ks, [r[11] for r in summary_rows], '^-', label='main: int')
+        if mode != 'plain':
+            ax_main.plot(Ks, [r[12] for r in summary_rows], 'D-', label='main: ext')
+        ax_main.set_title('среднее число "основных" точек (dist < h)')
+        ax_main.set_xlabel('K')
+        ax_main.grid(alpha=0.3); ax_main.legend(fontsize=8)
 
-        axes[1, 1].set_title('внутренние "основные" точки vs θ (нормальная инф.)')
-        axes[1, 1].set_xlabel('θ [deg]')
-        axes[1, 1].grid(alpha=0.3); axes[1, 1].legend()
+        ax_main_int.set_title('внутренние "основные" точки vs θ (нормальная инф.)')
+        ax_main_int.set_xlabel('θ [deg]')
+        ax_main_int.grid(alpha=0.3); ax_main_int.legend(fontsize=8)
+
+        # 4) граничные точки: d0 vs θ, цвет = r_exterior (для последнего K)
+        last_K = K_list_eff[-1]                      # ← FIX: было K_list[-1] → KeyError
+        last = results[last_K]
+        sc = ax_cbar.scatter(theta_sorted, last['domain_radius'],
+                             c=last['r_exterior'], cmap='viridis', s=10)
+        fig.colorbar(sc, ax=ax_cbar, label='r_exterior [ξ]')
+        ax_cbar.set_title(f'граница: $d_0$ vs θ (K={last_K})')
+        ax_cbar.set_xlabel('θ [deg]')
+        ax_cbar.set_ylabel('$d_0$ [ξ]')
+        ax_cbar.grid(alpha=0.3)
+
+        # 6) цветовая карта domain radius по ВСЕМ точкам
+        d_all = dist_full[:, -1]
+        sc_all = ax_all.scatter(self.sites[:, 0], self.sites[:, 1],
+                                c=d_all, cmap='plasma', s=8, edgecolors='none')
+        if mode == 'mirror':
+            ax_all.scatter(nb.mirror_coords[:, 0], nb.mirror_coords[:, 1],
+                           marker='x', s=12, c='k', label='mirror')
+        elif mode == 'ghost':
+            ax_all.scatter(nb.ghost_coords[:, 0], nb.ghost_coords[:, 1],
+                           marker='x', s=12, c='k', label='ghost')
+        ax_all.scatter(self.sites[b, 0], self.sites[b, 1],
+                       s=12, facecolors='none', edgecolors='r', linewidths=0.6, label='boundary')
+        fig.colorbar(sc_all, ax=ax_all, label='domain radius [ξ]')
+        ax_all.set_title(f'domain radius, все точки (K={Kmax}, mode={mode})')
+        ax_all.set_xlabel('x [ξ]')
+        ax_all.set_ylabel('y [ξ]')
+        ax_all.set_aspect('equal')
+        ax_all.grid(alpha=0.3)
+        ax_all.legend(fontsize=8)
 
         if save:
             fig.savefig(save, dpi=150, bbox_inches='tight')
+            print(f"Saved to {save}")
 
-        # Текстовая сводка
-        print(f"\n📐 Boundary stencil analysis (h_main = {h_main:.2f}):")
-        print("=" * 105)
+        # ---------------- текстовая сводка ----------------
+        print(f"\n📐 Boundary stencil analysis (h_main = {h_main:.2f}, mode = {mode}, Kmax = {Kmax}):")
+        print("=" * 150)
         print(f"{'K':>4} | {'d0 mean':>8} {'min':>7} {'max':>7} | "
-              f"{'n_bnd':>6} {'n_int':>6} | {'main':>6} {'m_bnd':>6} {'m_int':>6}")
-        print("-" * 105)
+              f"{'n_bnd':>6} {'n_int':>6} {'n_ext':>6} | "
+              f"{'r_int':>7} {'r_ext':>7} | "
+              f"{'main':>6} {'m_bnd':>6} {'m_int':>6} {'m_ext':>6}")
+        print("-" * 150)
         for r in summary_rows:
             print(f"{r[0]:>4} | {r[1]:>8.3f} {r[2]:>7.3f} {r[3]:>7.3f} | "
-                  f"{r[4]:>6.1f} {r[5]:>6.1f} | {r[6]:>6.1f} {r[7]:>6.1f} {r[8]:>6.1f}")
-        print("=" * 105 + "\n")
+                  f"{r[4]:>6.1f} {r[5]:>6.1f} {r[6]:>6.1f} | "
+                  f"{r[7]:>7.3f} {r[8]:>7.3f} | "
+                  f"{r[9]:>6.1f} {r[10]:>6.1f} {r[11]:>6.1f} {r[12]:>6.1f}")
+        print("=" * 150 + "\n")
 
         return results

@@ -28,13 +28,13 @@ from .geometry import (
     close_curve,
 )
 
+
 @dataclass
 class LSFDNeighbors:
-    """Данные о соседях для метода LSFD."""
-    indices: np.ndarray  # (N, K)
-    coords: np.ndarray  # (N, K, 2)
-    distances: np.ndarray  # (N, K)
-    lsfd_edge_vectors: np.ndarray # (N, K, 2)
+    indices: np.ndarray
+    coords: np.ndarray
+    distances: np.ndarray
+    lsfd_edge_vectors: np.ndarray
     indices_with_ghosts: np.ndarray
     coords_with_ghosts: np.ndarray
     distances_with_ghosts: np.ndarray
@@ -42,6 +42,19 @@ class LSFDNeighbors:
     ghost_dist: float
     ghost_coords: np.ndarray
     indices_of_own_ghost_point_in_sites_with_ghosts: np.ndarray
+    # --- mirror points (None, если не построены) ---
+    indices_with_mirrors:  np.ndarray | None = None
+    coords_with_mirrors:   np.ndarray | None = None
+    distances_with_mirrors:np.ndarray | None = None
+    lsfd_edge_vectors_with_mirrors: np.ndarray | None = None
+    mirror_coords:   np.ndarray | None = None
+    mirror_inner:    np.ndarray | None = None
+    mirror_intersec: np.ndarray | None = None
+    d_vectors:  np.ndarray | None = None
+    edge_verts: np.ndarray | None = None
+    w_lin:      np.ndarray | None = None
+    edge: np.ndarray | None = None
+
 
 class Mesh:
     def __init__(
@@ -55,6 +68,7 @@ class Mesh:
             lsfd_neighbors: Optional[LSFDNeighbors] = None,
             n_lsfd_neighbors: int = 15,
             ghost_coeff: float = 1,
+            mirror_layers: int = 1,  # ← ДОБАВИТЬ
     ):
         self.sites = np.asarray(sites, dtype=np.float64).squeeze()
         self.elements = np.asarray(elements, dtype=np.int64).squeeze()
@@ -65,7 +79,7 @@ class Mesh:
         self.lsfd_neighbors = lsfd_neighbors
         self.n_lsfd_neighbors = n_lsfd_neighbors
         self.ghost_coeff = ghost_coeff
-
+        self.mirror_layers = int(mirror_layers)  # ← ДОБАВИТЬ
         self._center_of_mass: Optional[Tuple[float, float]] = None
 
     # ========================================================================
@@ -591,6 +605,7 @@ class Mesh:
         # === Глобальные параметры ===
         h5group.attrs["n_lsfd_neighbors"] = self.n_lsfd_neighbors
         h5group.attrs["ghost_coeff"] = self.ghost_coeff
+        h5group.attrs["mirror_layers"] = self.mirror_layers  # ← ДОБАВИТЬ
         h5group.attrs["h_boundary"] = float(np.mean(
             self.tri_mesh.edge_lengths[self.tri_mesh.boundary_edge_indices]))
         for k, v in meta.items():
@@ -632,6 +647,23 @@ class Mesh:
                                 compression=compression)
         lsfd_grp.attrs["ghost_dist"] = float(nb.ghost_dist)
 
+        # ← НОВОЕ: СОХРАНЕНИЕ MIRROR POINTS (ЕСЛИ ЕСТЬ)
+        if nb.indices_with_mirrors is not None:
+            lsfd_grp.create_dataset("indices_with_mirrors", data=nb.indices_with_mirrors, compression=compression)
+            lsfd_grp.create_dataset("coords_with_mirrors", data=nb.coords_with_mirrors, compression=compression)
+            lsfd_grp.create_dataset("distances_with_mirrors", data=nb.distances_with_mirrors, compression=compression)
+            lsfd_grp.create_dataset("lsfd_edge_vectors_with_mirrors",
+                                    data=nb.lsfd_edge_vectors_with_mirrors, compression=compression)
+            lsfd_grp.create_dataset("mirror_coords", data=nb.mirror_coords, compression=compression)
+            lsfd_grp.create_dataset("mirror_inner", data=nb.mirror_inner, compression=compression)
+            lsfd_grp.create_dataset("mirror_intersec", data=nb.mirror_intersec, compression=compression)
+            lsfd_grp.create_dataset("d_vectors", data=nb.d_vectors, compression=compression)
+            lsfd_grp.create_dataset("edge_verts", data=nb.edge_verts, compression=compression)
+            # w_lin — это кортеж из двух массивов, сохраняем как стек
+            lsfd_grp.create_dataset("w_lin", data=np.stack(nb.w_lin), compression=compression)
+            lsfd_grp.create_dataset("edge", data=np.stack(nb.edge), compression=compression)
+
+
         # === Метаданные ===
         h5group.attrs["n_sites"] = self.n_sites
         h5group.attrs["n_elements"] = self.n_elements
@@ -639,8 +671,10 @@ class Mesh:
     @classmethod
     def from_hdf5(cls, h5group: h5py.Group,
                   n_lsfd_neighbors: Optional[int] = None,
-                  ghost_coeff: Optional[float] = None) -> "Mesh":
-        """Загрузить Mesh. Если K/ghost изменены или файл старый — пересобрать соседей."""
+                  ghost_coeff: Optional[float] = None,
+                  build_mirror: bool = True,  # ← изменить на True
+                  layers: Optional[int] = None) -> "Mesh":  # ← изменить на Option
+        """Загрузить Mesh. Если K/ghost/mirror изменены или файл старый — пересобрать соседей."""
         for name in ["sites", "elements", "boundary_indices"]:
             if name not in h5group:
                 raise IOError(f"Missing required dataset: {name}")
@@ -650,8 +684,10 @@ class Mesh:
 
         saved_K = int(h5group.attrs.get("n_lsfd_neighbors", 15))
         saved_gc = float(h5group.attrs.get("ghost_coeff", 1.0))
+        saved_layers = int(h5group.attrs.get("mirror_layers", 1))  # ← ДОБАВИТЬ
         K = int(n_lsfd_neighbors) if n_lsfd_neighbors is not None else saved_K
         gc = float(ghost_coeff) if ghost_coeff is not None else saved_gc
+        L = int(layers) if layers is not None else saved_layers  # ← ДОБАВИТЬ
 
         # === TriMesh ===
         tri_grp = h5group["tri_mesh"]
@@ -683,13 +719,21 @@ class Mesh:
         else:
             dual_mesh.voronoi_polygons = []
 
-        # === LSFD Neighbors: прочитать ИЛИ пересобрать ===
+            # === LSFD Neighbors: прочитать ИЛИ пересобрать ===
         lsfd_grp = h5group["lsfd_neighbors"]
-        need_rebuild = (K != saved_K) or (gc != saved_gc) or ("indices_with_ghosts" not in lsfd_grp)
+        need_rebuild = (K != saved_K) or (gc != saved_gc) or (L != saved_layers) \
+                       or ("indices_with_ghosts" not in lsfd_grp) \
+                       or (build_mirror and "indices_with_mirrors" not in lsfd_grp)
         if need_rebuild:
-            logger.info(f"Mesh.from_hdf5: rebuilding LSFD neighbors (K={K}, saved K={saved_K})")
-            lsfd_neighbors = cls.build_lsfd_neighbors(sites, boundary_indices, tri_mesh, K, gc)
+            logger.info(f"Mesh.from_hdf5: rebuilding LSFD neighbors "
+                        f"(K={K}/{saved_K}, layers={L}/{saved_layers}, mirror={build_mirror})")
+            lsfd_neighbors = cls.build_lsfd_neighbors(sites, boundary_indices, tri_mesh, K, gc,
+                                                      build_mirror=build_mirror, layers=L)
         else:
+            def _opt(name):
+                return np.array(lsfd_grp[name]) if name in lsfd_grp else None
+
+            w_raw = _opt("w_lin")
             lsfd_neighbors = LSFDNeighbors(
                 indices=np.array(lsfd_grp["indices"]),
                 coords=np.array(lsfd_grp["coords"]),
@@ -702,11 +746,21 @@ class Mesh:
                 ghost_dist=float(lsfd_grp.attrs["ghost_dist"]),
                 ghost_coords=np.array(lsfd_grp["ghost_coords"]),
                 indices_of_own_ghost_point_in_sites_with_ghosts=np.array(lsfd_grp["indices_of_own_ghost"]),
+                indices_with_mirrors=_opt("indices_with_mirrors"),
+                coords_with_mirrors=_opt("coords_with_mirrors"),
+                distances_with_mirrors=_opt("distances_with_mirrors"),
+                lsfd_edge_vectors_with_mirrors=_opt("lsfd_edge_vectors_with_mirrors"),
+                mirror_coords=_opt("mirror_coords"),
+                mirror_inner=_opt("mirror_inner"),
+                mirror_intersec=_opt("mirror_intersec"),
+                d_vectors=_opt("d_vectors"),
+                edge_verts=_opt("edge_verts"),
+                edge=_opt("edge"),  # ← ИСПРАВИТЬ: было _opt("edge_verts")
+                w_lin=(w_raw[0], w_raw[1]) if w_raw is not None else None,
             )
-
         return cls(sites=sites, elements=elements, boundary_indices=boundary_indices,
                    tri_mesh=tri_mesh, dual_mesh=dual_mesh, lsfd_neighbors=lsfd_neighbors,
-                   n_lsfd_neighbors=K, ghost_coeff=gc)
+                   n_lsfd_neighbors=K, ghost_coeff=gc, mirror_layers=L)  # ← ДОБАВИТЬ mirror_layers
 
     # ========================================================================
     # УДОБНЫЕ МЕТОДЫ
@@ -723,6 +777,144 @@ class Mesh:
         with h5py.File(filepath, "r") as f:
             return cls.from_hdf5(f)
 
+    def _seg_dist2(self, p, a, b):
+        ab = b - a
+        t = np.clip(((p - a) @ ab) / (ab @ ab), 0.0, 1.0)
+        r = (p - a) - t * ab
+        return r @ r
+
+    @staticmethod
+    def _seg_dist2(p, a, b):
+        ab = b - a
+        t = np.clip(((p - a) @ ab) / (ab @ ab), 0.0, 1.0)
+        r = (p - a) - t * ab
+        return r @ r
+
+    @staticmethod
+    def build_mirror_points(tri_mesh, layers=1):
+        """
+        Mirror (ghost) точки вне области, слои 1..layers.
+        Слой 1: внутренняя вершина граничного треугольника, ребро = ребро этого треугольника.
+        Слои >= 2: BFS по кольцам; для каждой новой вершины ребро выбирается
+        робастно: ближайшие 10 граничных вершин -> инцидентные граничные рёбра ->
+        остроугольный треугольник (основание перпендикуляра внутри ребра).
+        """
+        tri = tri_mesh
+        sites = tri.sites
+        bnd_ids = tri.boundary_edge_indices
+        bnd_set = set(bnd_ids.tolist())
+        bnd_edges = tri.edges[bnd_ids]  # (B,2)
+        bnd_n = tri.boundary_edge_normals  # (B,2), наружу, единичные
+        bnd_pos = {int(e): k for k, e in enumerate(bnd_ids)}
+        bnd_verts = set(bnd_edges.ravel())
+
+        vert_tris = {}
+        for t, vs in enumerate(tri.triangles):
+            for v in vs:
+                vert_tris.setdefault(int(v), []).append(t)
+
+        # граничная вершина -> инцидентные граничные рёбра (позиции в bnd-массивах)
+        vert_bnd_edges = {}
+        for k, (v1, v2) in enumerate(bnd_edges):
+            vert_bnd_edges.setdefault(int(v1), []).append(k)
+            vert_bnd_edges.setdefault(int(v2), []).append(k)
+
+        bnd_site_ids = np.array(sorted(bnd_verts), dtype=np.int64)
+        kdtree_bnd = KDTree(sites[bnd_site_ids])
+
+        def robust_edge(v):
+            """Ребро для отражения вершины v: остроугольный треугольник с ближайшими граничными.
+            Возвращает ГЛОБАЛЬНЫЙ индекс ребра в tri.edges."""
+            p = sites[v]
+            _, idx = kdtree_bnd.query(p, k=min(10, len(bnd_site_ids)))
+            cand = set()
+            for j in idx:
+                cand.update(vert_bnd_edges.get(int(bnd_site_ids[j]), ()))
+            best = [None, None, None]  # 0: остроуг., 1: основание внутри, 2: фолбэк
+            for k in cand:
+                a, b = sites[bnd_edges[k, 0]], sites[bnd_edges[k, 1]]
+                w = b - a
+                u = a - p
+                vv = b - p
+                foot_in = (u @ w) < 0.0 and (vv @ w) > 0.0
+                acute_p = (u @ vv) > 0.0
+                dist = abs((a - p) @ bnd_n[k])
+                tier = 0 if (foot_in and acute_p) else (1 if foot_in else 2)
+                if best[tier] is None or dist < best[tier][0]:
+                    best[tier] = (dist, k)
+            for t in best:
+                if t is not None:
+                    return int(bnd_ids[t[1]])  # ← глобальный индекс
+            k_best = min(cand, key=lambda k: abs((sites[bnd_edges[k, 0]] - p) @ bnd_n[k]))
+            return int(bnd_ids[k_best])  # ← глобальный индекс
+
+        # ---- слой 1 ----
+        pairs = []
+        for t in range(len(tri.triangles)):
+            verts = [int(v) for v in tri.triangles[t]]
+            for e in tri.tri_to_edges[t]:
+                if e not in bnd_set:
+                    continue
+                ev = set(tri.edges[e])
+                opp = [v for v in verts if v not in ev][0]
+                if opp not in bnd_verts:
+                    pairs.append((opp, int(e)))
+        assigned = {s: e for s, e in pairs}
+        frontier = list(assigned.keys())
+
+        # ---- слои 2..layers: BFS + робастный выбор ребра ----
+        for _ in range(max(0, layers - 1)):
+            nxt = set()
+            for s in frontier:
+                for t in vert_tris.get(s, []):
+                    for v in tri.triangles[t]:
+                        v = int(v)
+                        if v in bnd_verts or v in assigned:
+                            continue
+                        nxt.add(v)
+            new = []
+            for v in sorted(nxt):
+                e = robust_edge(v)
+                assigned[v] = e
+                new.append((v, e))
+            pairs.extend(new)
+            frontier = [v for v, _ in new]
+            if not frontier:
+                break
+
+        pairs = sorted(set(pairs))
+        M = len(pairs)
+
+        indices = np.empty(M, dtype=np.int64)
+        edge_verts = np.empty((M, 2), dtype=np.int64)
+        intersec = np.empty((M, 2))
+        d = np.empty((M, 2))
+        coords = np.empty((M, 2))
+        s_par = np.empty(M)
+        edge = np.empty(M, dtype=np.int64)
+
+        for m, (src, e) in enumerate(pairs):
+            k = bnd_pos[e]
+            v1, v2 = bnd_edges[k]
+            a, b = sites[v1], sites[v2]
+            L = tri.edge_lengths[e]
+            tau = (b - a) / L
+            n = bnd_n[k]
+            dist = (a - sites[src]) @ n
+            q = sites[src] + dist * n
+            edge_verts[m, 0], edge_verts[m, 1] = v1, v2
+            intersec[m] = q
+            d[m] = q - sites[src]
+            coords[m] = sites[src] + 2.0 * d[m]
+            indices[m] = src
+            s_par[m] = ((q - a) @ tau) / L
+            edge[m] = k
+
+        w_lin = (1.0 - s_par, s_par)
+        return {'coords': coords, 'indices': indices, 'intersec': intersec,
+                'd': d, 'edge_verts': edge_verts, 'edge': edge,
+                's': s_par, 'w_lin': w_lin}
+
     @staticmethod
     def build_lsfd_neighbors(
             sites: np.ndarray,
@@ -730,10 +922,11 @@ class Mesh:
             tri_mesh: "TriMesh",
             n_lsfd_neighbors: int,
             ghost_coeff: float = 1.0,
-            use_ghost_points: bool = True,
+            build_mirror: bool = True,
             verbose: bool = True,  # ← печатать отчёт
             validate: bool = False,
             tol: float = 1e-8,
+            layers: int = 1,
     ) -> LSFDNeighbors:
         """Построить LSFD-соседей. use_ghost_points=False -> только обычные соседи."""
         sites = np.asarray(sites, dtype=np.float64)
@@ -758,6 +951,27 @@ class Mesh:
         I = iwg[boundary_indices]             # (B, K)
         own_ghost = np.argmax(I == np.arange(len(boundary_indices))[:, None], axis=1)
 
+        # --- mirror points ---
+
+        # --- mirror points: отдельные массивы, аналогично ghost ---
+        indices_with_mirrors = coords_with_mirrors = distances_with_mirrors = None
+        lsfd_edge_vectors_with_mirrors = None
+        mirror_coords = mirror_inner = mirror_intersec = d_vectors = edge_verts = w_lin = edge = None
+        if build_mirror:
+            bm = Mesh.build_mirror_points(tri_mesh, layers)
+            mirror_coords, mirror_inner = bm['coords'], bm['indices']
+            mirror_intersec = bm['intersec']
+            d_vectors, edge_verts, w_lin, edge = bm['d'], bm['edge_verts'], bm['w_lin'], bm['edge']
+
+            sites_with_mirrors = np.concatenate([mirror_coords, sites])  # (M+N, 2)
+            kdtree_m = KDTree(sites_with_mirrors)
+            dwm, iwm = kdtree_m.query(sites_with_mirrors, k=n_lsfd_neighbors + 1)
+            dwm = dwm[len(mirror_coords):, 1:]  # ← было bag: len(ghost_coords)
+            iwm = iwm[len(mirror_coords):, 1:]
+            cwm = sites_with_mirrors[iwm] - sites[:, np.newaxis, :]
+            indices_with_mirrors, coords_with_mirrors = iwm, cwm
+            distances_with_mirrors = dwm
+            lsfd_edge_vectors_with_mirrors = cwm
 
         nb = LSFDNeighbors(
             indices=indices, coords=coords, distances=distances,
@@ -766,6 +980,13 @@ class Mesh:
             distances_with_ghosts=dwg, lsfd_edge_vectors_with_ghosts=cwg,
             ghost_dist=n_dist, ghost_coords=ghost_coords,
             indices_of_own_ghost_point_in_sites_with_ghosts=own_ghost,
+            indices_with_mirrors=indices_with_mirrors,
+            coords_with_mirrors=coords_with_mirrors,
+            distances_with_mirrors=distances_with_mirrors,
+            lsfd_edge_vectors_with_mirrors=lsfd_edge_vectors_with_mirrors,
+            mirror_coords=mirror_coords, mirror_inner=mirror_inner,
+            mirror_intersec=mirror_intersec,
+            d_vectors=d_vectors, edge_verts=edge_verts, w_lin=w_lin, edge = edge
         )
 
         # --- валидация применяется СРАЗУ к готовому LSFDNeighbors ---
@@ -860,6 +1081,7 @@ class Mesh:
             elements: Sequence[Tuple[int, int, int]],
             n_lsfd_neighbors: int = 15,  # ← глобальный параметр
             ghost_coeff: float = 1.0,
+            layers: int = 1,  # ← ИСПРАВИТЬ: было float,
     ) -> "Mesh":
         """
         Создать Mesh из триангуляции.
@@ -888,8 +1110,8 @@ class Mesh:
 
         # === 4. lsfd_neighbors ===
         lsfd_neighbors = Mesh.build_lsfd_neighbors(
-            sites, boundary_indices, tri_mesh, n_lsfd_neighbors)
-
+            sites, boundary_indices, tri_mesh, n_lsfd_neighbors,
+            ghost_coeff=ghost_coeff, build_mirror=True, layers=layers)  # ← ДОБАВИТЬ build_mirror=True
         return Mesh(
             sites=sites,
             elements=elements,
@@ -897,7 +1119,9 @@ class Mesh:
             tri_mesh=tri_mesh,
             dual_mesh=dual_mesh,
             lsfd_neighbors=lsfd_neighbors,
-            n_lsfd_neighbors=n_lsfd_neighbors,  # ← передаём в __init__
+            n_lsfd_neighbors=n_lsfd_neighbors,
+            ghost_coeff=ghost_coeff,
+            mirror_layers=layers,  # ← ДОБАВИТЬ
         )
 
     @staticmethod
