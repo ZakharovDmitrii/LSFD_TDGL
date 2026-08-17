@@ -1,4 +1,5 @@
 import numpy as np
+from typing import Callable, Tuple, Union
 import scipy.sparse as sp
 from scipy.spatial import KDTree
 from .numba_kernels import get_batched_dot
