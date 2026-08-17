@@ -1,19 +1,9 @@
-import warnings
 from typing import Callable, Tuple, Union
 import time
-import itertools as it
 import numpy as np
 import scipy.sparse as sp
-from scipy.misc import derivative
-from sklearn.neighbors import NearestNeighbors
-from scipy.sparse.linalg import factorized, spsolve, splu
-from scipy.sparse import lil_matrix, bmat, csc_matrix, coo_matrix
-from collections import defaultdict
-from scipy import interpolate
 from scipy.spatial import KDTree
-from scipy.sparse.linalg import lsqr
 from .numba_kernels import get_batched_dot
-
 from tdgl_LSFD_lib.mesh.mesh import Mesh
 
 # ----------------------------------------------------------------
