@@ -1,30 +1,37 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tdgl_lsfd"
-version = "0.1.0"
-description = "TDGL solver using Least Squares Finite Difference (LSFD) method"
+name = "tdgl_LSFD_lib"
+version = "0.1.0b1"
+description = "TDGL solver on unstructured meshes using LSFD (Least Squares Finite Differences)"
 readme = "README.md"
-requires-python = ">=3.9"
-dependencies = [
-    "h5py>=3.0",
-    "matplotlib>=3.5",
-    "MeshPy>=2022.1",
-    "numba>=0.55",
-    "numpy>=1.24",
-    "opt_einsum>=3.3",
-    "scipy>=1.7",
-    "Shapely>=2.0",
-    "tqdm>=4.60",
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Dmitrii Zakharov", email = "dmitrii.zakharov@metalab.ifmo.ru"}
+]
+keywords = ["TDGL", "superconductivity", "spin-orbit coupling", "LSFD", "finite differences", "unstructured mesh"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest",
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "h5py>=3.8",
+    "meshpy>=2022.1",
+    "shapely>=2.0",
+    "scikit-learn>=1.2",
+    "tqdm>=4.65",
+    "numba>=0.57",
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["tdgl_LSFD_lib*"]
