@@ -55,7 +55,7 @@ class SolverOptions:
     # ConservationTracker: energy, current conservation, Poisson residual, boundary currents
     track_conservation: bool = True   # Enable ConservationTracker (auto-created by Runner)
     # PhysicalTracker: mu and phase at probe points (requires device.probe_points)
-    track_physical: bool = True       # Enable PhysicalTracker (auto-created by Runner)
+    track_physical: bool = False       # Enable PhysicalTracker (auto-created by Runner)
     # VortexTracker: vortex positions, velocities, charges (future)
     track_vortices: bool = False      # Enable VortexTracker (auto-created by Runner)
     max_vortices: int = 5             # Maximum number of vortices to track
