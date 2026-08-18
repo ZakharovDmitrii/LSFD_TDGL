@@ -12,7 +12,8 @@ from tdgl_LSFD_lib.solver.dynamics_options import SolverOptions, TimeScheme
 from tdgl_LSFD_lib.solver.solve import solve
 from tdgl_LSFD_lib.post_processing.plot_solution import plot_summary, plot_conservation_summary
 from tdgl_LSFD_lib.post_processing.animation import make_video_from_solution
-
+from tdgl_LSFD_lib.mesh.mesh import Mesh
+import h5py
 
 def get_unique_filename(output_dir: Path, R, h, Bz, scheme, eta, h_dir, weight, time_val) -> str:
     """
