@@ -8,7 +8,7 @@
 
 <p align="center">
   <img src="images/four_vortex.png" width="45%" alt="Vortices on radial film">
-  <img src="images/shifted_vortex.png" width="45%" alt="Supercurrent distribution, gamma = 0.1">
+  <img src="images/shifted_vortex.png" width="35%" alt="Supercurrent distribution, gamma = 0.1">
 </p>
 <p align="center"><i>Left: vortices on radial film — |ψ|, phase, μ, supercurrent, normal current, div(Js). Right: supercurrent distribution for γ = 0.1.</i></p>
 
