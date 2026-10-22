@@ -168,9 +168,14 @@ class TDGLSolver:
             psi, A_applied, s_applied=s_applied, eta=eta, gamma=gamma, Bz=Bz, psi_derivatives = psi_derivatives,
             A_at_intersec = self.A_for_mirror_sites,
         )
-        psi_derivatives = self.operators._batched_dot(
-            self.operators.G_matrix_psi_gamma, delta_psi
-        )
+        if gamma != 0:
+            psi_derivatives = self.operators._batched_dot(
+                self.operators.G_matrix_psi_gamma, delta_psi
+            )
+        else:
+            psi_derivatives = self.operators._batched_dot(
+                self.operators.G_matrix_psi, delta_psi
+            )
         return psi_derivatives
 
     def solve_mu(self, div_J: np.ndarray, J_boundary: np.ndarray,
@@ -205,7 +210,7 @@ class TDGLSolver:
         laplasian_psi = psi_derivatives[:, 2] + psi_derivatives[:, 3]
 
         psi_conj = psi.conjugate()
-        abs_psi_sq = np.abs(psi)**2
+        abs_psi_sq =  (psi * psi.conjugate()).real
 
         J0_x = (psi_conj * Dpsi_x).imag + eta * s_x * abs_psi_sq
         J0_y = (psi_conj * Dpsi_y).imag + eta * s_y * abs_psi_sq
@@ -219,17 +224,17 @@ class TDGLSolver:
         Dpsi_yy = psi_derivatives[:, 3]
         Dpsi_xy = psi_derivatives[:, 4]
 
-        J1_x = gamma * Dpsi_x.conjugate() * s_grad_psi
-        J1_y = gamma * Dpsi_y.conjugate() * s_grad_psi
+        J1_x = Dpsi_x.conjugate() * s_grad_psi
+        J1_y = Dpsi_y.conjugate() * s_grad_psi
 
-        J2_x = -gamma * psi_conj * (s_x * Dpsi_xx + s_y * Dpsi_xy)
-        J2_y = -gamma * psi_conj * (s_x * Dpsi_xy + s_y * Dpsi_yy)
+        J2_x = -psi_conj * (s_x * Dpsi_xx + s_y * Dpsi_xy)
+        J2_y = -psi_conj * (s_x * Dpsi_xy + s_y * Dpsi_yy)
 
-        J3_x = -gamma * s_x * (psi_conj * laplasian_psi)
-        J3_y = -gamma * s_y * (psi_conj * laplasian_psi)
+        J3_x = -s_x * (psi_conj * laplasian_psi)
+        J3_y = -s_y * (psi_conj * laplasian_psi)
 
-        J_x = J0_x + J1_x.real + J2_x.real + J3_x.real
-        J_y = J0_y + J1_y.real + J2_y.real + J3_y.real
+        J_x = J0_x + gamma * (J1_x + J2_x + J3_x).real
+        J_y = J0_y + gamma * (J1_y + J2_y + J3_y).real
 
         return J_x, J_y, s_grad_psi
 
@@ -250,7 +255,7 @@ class TDGLSolver:
         Dpsi_yyx = psi_derivatives[:, 8]
 
         div_J0 = (psi_conj * (Dpsi_xx + Dpsi_yy)).imag
-        divJ_eta = eta * (psi_conj * s_grad_psi + psi * s_grad_psi.conjugate())
+        divJ_eta = 2 * eta * (psi_conj * s_grad_psi).real
 
         if gamma == 0:
             return div_J0 + divJ_eta
@@ -287,11 +292,11 @@ class TDGLSolver:
             ))
         else:
             psi = U * (psi + (dt / u) * (
-                    psi * (1 - abs_sq_psi) +
-                    Dpsi_xx + Dpsi_yy +
-                    2 * eta * 1j * (s_x * Dpsi_x + s_y * Dpsi_y) +
-                    2 * gamma * 1j * s_x * (Dpsi_xxx + Dpsi_yyx + 1j * Bz * Dpsi_y) +
-                    2 * gamma * 1j * s_y * (Dpsi_yyy + Dpsi_xxy - 1j * Bz * Dpsi_x)
+                    psi * (1 - abs_sq_psi)
+                    + Dpsi_xx + Dpsi_yy
+                    + 2 * eta * 1j * (s_x * Dpsi_x + s_y * Dpsi_y)
+                    - 2 * gamma * 1j * s_x * (Dpsi_xxx + Dpsi_yyx) #-
+                    - 2 * gamma * 1j * s_y * (Dpsi_yyy + Dpsi_xxy) #-
             ))
 
         new_sq_psi = np.absolute(psi) ** 2

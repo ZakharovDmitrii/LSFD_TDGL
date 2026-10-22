@@ -24,7 +24,7 @@ HDF5 structure (new architecture):
 import h5py
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 class Solution:
@@ -86,7 +86,8 @@ class Solution:
 
             # Time series keys
             if 'time_series' in f:
-                self._time_series_keys = list(f['time_series'].keys())
+                self._time_series_keys = [key for key, value in f['time_series'].items()
+                                          if isinstance(value, h5py.Dataset)]
             else:
                 self._time_series_keys = []
 
@@ -246,6 +247,62 @@ class Solution:
                 result['coords'] = np.array(ts['probe_points_coords'])
             if 'probe_points_indices' in ts:
                 result['indices'] = np.array(ts['probe_points_indices'])
+
+        return result
+
+    # !!!14.10_vortex!!! Convenience accessor for VortexTracker time series.
+    def get_vortex_data(self) -> Dict[str, Any]:
+        """
+        Read dynamic v2 tables or legacy fixed-slot vortex data.
+
+        New files return schema_version=2, time, step, dyn_info, stat_info,
+        deaths and frame_offsets. Charges/births occur once per immutable ID.
+        Legacy files keep their previous x/y/vx/vy dictionary representation.
+
+        Returns:
+            Dictionary with keys:
+                - 'time': time array
+                - 'x', 'y': vortex coordinates, shape (n_times, n_vortices)
+                - 'vx', 'vy': vortex velocities, shape (n_times, n_vortices)
+                - 'charge': topological charges (+1/-1; 0 for an empty slot)
+                - 'triangle_index': containing triangle (-1 for an empty slot)
+                - 'site_index', 'min_abs_psi': optional diagnostics in older files
+        """
+        with h5py.File(self.path, 'r') as f:
+            if 'time_series/vortices/dyn_info' in f:
+                ts = f['time_series']
+                group = ts['vortices']
+                return {
+                    'schema_version': 2,
+                    'time': np.array(ts['time']),
+                    'step': np.array(ts['step']),
+                    'dyn_info': np.array(group['dyn_info']),
+                    'stat_info': np.array(group['stat_info']),
+                    'deaths': np.array(group['deaths']),
+                    'frame_offsets': np.array(group['frame_offsets']),
+                }
+        if 'vortex_x' not in self._time_series_keys:
+            raise KeyError(
+                "No vortex data found. Check that track_vortices=True in SolverOptions."
+            )
+
+        with h5py.File(self.path, 'r') as f:
+            ts = f['time_series']
+            result = {
+                'time': np.array(ts['time']),
+                'x': np.array(ts['vortex_x']),
+                'y': np.array(ts['vortex_y']),
+                'vx': np.array(ts['vortex_vx']),
+                'vy': np.array(ts['vortex_vy']),
+            }
+            if 'vortex_site_index' in ts:
+                result['site_index'] = np.array(ts['vortex_site_index'])
+            if 'vortex_min_abs_psi' in ts:
+                result['min_abs_psi'] = np.array(ts['vortex_min_abs_psi'])
+            if 'vortex_charge' in ts:
+                result['charge'] = np.array(ts['vortex_charge'])
+            if 'vortex_triangle_index' in ts:
+                result['triangle_index'] = np.array(ts['vortex_triangle_index'])
 
         return result
 

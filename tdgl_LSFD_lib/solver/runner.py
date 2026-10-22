@@ -30,6 +30,7 @@ from ..external_fields.external_fields import StepFields
 from ..trackers.base_tracker import SimulationTracker
 from ..trackers.conservation_tracker import ConservationTracker
 from ..trackers.physical_tracker import PhysicalTracker
+from ..trackers.vortex_tracker import VortexTracker  # !!!14.10_vortex!!!
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,16 @@ class TDGLRunner:
                 device=self.solver.device,
                 buffer_size=buffer_size,
             ))
+        # !!!14.10_vortex!!! Optional Abrikosov vortex position/velocity tracker.
+        if self.options.track_vortices:
+            trackers.append(VortexTracker(
+                sites=self.solver.device.mesh.sites,
+                triangles=self.solver.device.mesh.tri_mesh.triangles,
+                buffer_size=buffer_size,
+                max_match_distance=self.options.vortex_max_match_distance,  # !!!14.10_vort1!!!
+                velocity_window=self.options.vortex_velocity_window,
+                velocity_min_points=self.options.vortex_velocity_min_points,
+            ))
         logger.info(f"Created {len(trackers)} tracker(s): {[type(t).__name__ for t in trackers]}")
         return trackers
 
@@ -290,6 +301,11 @@ class TDGLRunner:
                             self._dt_buf[self._buf_idx] = dt_used
                             self._poisson_tol_buf[self._buf_idx] = result.poisson_tolerance
                             self._buf_idx += 1
+
+                            # Optional lifecycle event (e.g. a vortex trajectory ended).
+                            # Flush the common clock and every tracker together.
+                            if save and any(getattr(tracker, "flush_requested", False) for tracker in self.trackers):
+                                self._flush_time_series(data_handler.time_series_group)
 
                         if save and (save_counter % self.options.save_every == 0):
                             self._save_snapshot(data_handler, psi, mu, result, fields)

@@ -33,7 +33,6 @@ class LSFD_operators:
         self.normal_vecs_length = 10**(-5) # 10**(-5) for 1r
                                                 # use as weight for boundary conditions and Poisson equation,
                                                  # depends on weight_function
-
         self.use_ghost_points = use_ghost_points
         self.ghost_version = ghost_version
         self.use_mirror_points = use_mirror_points
@@ -498,8 +497,8 @@ class LSFD_operators:
 
     # mirror implementation
 
-    def compute_mirror_values(self, psi: np.ndarray, s_applied: np.ndarray, eta: float,
-                              A_at_intersec: np.ndarray = None) -> np.ndarray:
+    def compute_mirror_values(self, psi: np.ndarray, s_applied: np.ndarray, eta: float, gamma,
+                              A_at_intersec: np.ndarray = None, psi_derivatives: np.ndarray = None) -> np.ndarray:
         """Значения psi в mirror-точках через правило отражения.
         psi_g = U*(U*psi_inner + 2|d|*g_b),  U = exp(+i A_b·d),  g_b = (n·Dpsi)_b = -i*eta*(n·s)*psi_b.
         psi_b восстанавливается линейно по концам ребра (обычный Тейлор, без линков)."""
@@ -510,13 +509,38 @@ class LSFD_operators:
         v1, v2 = self.mirror_edge_verts[:, 0], self.mirror_edge_verts[:, 1]
         psi_b = w1 * psi[v1] + w2 * psi[v2]                    # O(h^2), линки не нужны
         s_x, s_y = s_applied[0], s_applied[1]
+        n_x, n_y = self.mirror_normals[:, 0], self.mirror_normals[:, 1]
 
         n_dot_s = self.mirror_normals[:, 0] * s_x + self.mirror_normals[:, 1] * s_y
         A_dot_d = np.einsum('ij,ij->i', A_b, self.mirror_d)
 
         U = np.cos(A_dot_d) + 1j * np.sin(A_dot_d)             # = U_bp = U_bg^{-1}
         g_b = -1j * eta * n_dot_s * psi_b                      # то же (n·Dpsi), что в ghost
-        return U * (U * psi[self.mirror_inner] + 2.0 * self.mirror_d_len * g_b)
+
+        # eta version:  U * (U * psi[self.mirror_inner] + 2.0 * self.mirror_d_len * g_b)
+        # gamma version:
+
+        if psi_derivatives is None:
+            D_xx = np.zeros_like(psi)
+            D_yy = np.zeros_like(psi)
+            D_xy = np.zeros_like(psi)
+        else:
+            D_xx = psi_derivatives[:, 2]
+            D_yy = psi_derivatives[:, 3]
+            D_xy = psi_derivatives[:, 4]
+
+        D_xx_b = w1 * D_xx[v1] + w2 * D_xx[v2]
+        D_xy_b = w1 * D_xy[v1] + w2 * D_xy[v2]
+        D_yy_b = w1 * D_yy[v1] + w2 * D_yy[v2]
+
+        value1 = U * ( - U * psi[self.mirror_inner] + 2 * psi_b +
+                      (n_x**2 * D_xx_b + 2*n_x*n_y * D_xy_b + n_y**2 * D_yy_b) * self.mirror_d_len**2)
+        value2 =  U * (U * psi[self.mirror_inner] + 2.0 * self.mirror_d_len * g_b)
+        if gamma == 0:
+           return value2
+        else:
+           return (value1 + value2) * 0.5
+
 
     def compute_ghost_values(self, psi: np.ndarray, A_applied: np.ndarray, s_applied: np.ndarray,
                           eta: float, psi_derivatives: np.ndarray = None):
@@ -571,7 +595,7 @@ class LSFD_operators:
         n_dot_s = n_vec[:, 0] * s_x + n_vec[:, 1] * s_y
 
         if self.use_mirror_points:
-            psi_mirror = self.compute_mirror_values(psi, s_applied, eta, A_at_intersec=A_at_intersec)
+            psi_mirror = self.compute_mirror_values(psi, s_applied, eta, gamma, A_at_intersec=A_at_intersec, psi_derivatives=psi_derivatives)
             psi_ext = np.concatenate([psi_mirror, psi])
             if self._use_sparse_delta == False:
                 psi_i = psi[self.psi_i_idx]
@@ -619,9 +643,9 @@ class LSFD_operators:
                 delta_psi[self.boundary_indices, idx_last] = -1j * eta * n_dot_s * psi[self.boundary_indices]
 
         else:
-            n_rot_K = n_vec[:, 0] * s_y - n_vec[:, 1] * s_x
+            n_rot_s = n_vec[:, 0] * s_y - n_vec[:, 1] * s_x
             rhs1 = (eta / gamma) * n_dot_s * psi[self.boundary_indices]
-            rhs2 = 1j * (Bz / 2) * n_rot_K * psi[self.boundary_indices]
+            rhs2 = 1j * (Bz / 2) * n_rot_s * psi[self.boundary_indices]
             delta_psi[self.boundary_indices, idx_last] = np.zeros(len(self.boundary_indices), dtype = self.dtype)
             if self.use_ghost_points and self.ghost_version == 'asym':
                 delta_psi[self.boundary_indices, self.own_ghost_col_idx] = rhs1 + rhs2  # Или другое значение

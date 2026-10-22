@@ -63,3 +63,14 @@ htmlcov/
 # MyPy
 .mypy_cache/
 .pytest_cache/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Backup copies
+*копия*
+
+tdgl_LSFD_lib/solver/CPU_tests/
+tdgl_LSFD_lib/trackers/vortex_tracker_archive.py
+tdgl_LSFD_lib/device/meshing_no_way.py

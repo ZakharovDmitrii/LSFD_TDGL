@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Union
 from pathlib import Path
+from math import isfinite
 
 
 class TimeScheme(Enum):
@@ -56,9 +57,12 @@ class SolverOptions:
     track_conservation: bool = True   # Enable ConservationTracker (auto-created by Runner)
     # PhysicalTracker: mu and phase at probe points (requires device.probe_points)
     track_physical: bool = False       # Enable PhysicalTracker (auto-created by Runner)
-    # VortexTracker: vortex positions, velocities, charges (future)
+
     track_vortices: bool = False      # Enable VortexTracker (auto-created by Runner)
-    max_vortices: int = 5             # Maximum number of vortices to track
+    # Phase-zero detection on the physical CCW triangulation.
+    vortex_max_match_distance: float | None = 1.0  # xi per step; None also means 1.0
+    vortex_velocity_window: float = 0.05  # Trailing window for quadratic velocity regression
+    vortex_velocity_min_points: int = 5  # At least 3 points for the quadratic fit
     # Tracker logging
     tracker_log_every: int = 1000     # Log diagnostics every N steps (None to disable)
 
@@ -136,8 +140,22 @@ class SolverOptions:
             raise ValueError(
                 f"tracker_log_every must be >= 1 or None (got {self.tracker_log_every})"
             )
-        if self.max_vortices < 1:
-            raise ValueError(f"max_vortices must be >= 1 (got {self.max_vortices})")
+        # !!!14.10_vort1!!! Optional cap for nearest-neighbor vortex identity matching.
+        if self.vortex_max_match_distance is not None and (
+                not isfinite(self.vortex_max_match_distance) or self.vortex_max_match_distance <= 0):
+            raise ValueError(
+                "vortex_max_match_distance must be finite and > 0 or None "
+                f"(got {self.vortex_max_match_distance})"
+            )
+        if not isfinite(self.vortex_velocity_window) or self.vortex_velocity_window <= 0:
+            raise ValueError(
+                f"vortex_velocity_window must be finite and > 0 (got {self.vortex_velocity_window})"
+            )
+        if int(self.vortex_velocity_min_points) != self.vortex_velocity_min_points or self.vortex_velocity_min_points < 3:
+            raise ValueError(
+                "vortex_velocity_min_points must be an integer >= 3 "
+                f"(got {self.vortex_velocity_min_points})"
+            )
 
         # Convert time_scheme from string to Enum
         if isinstance(self.time_scheme, str):

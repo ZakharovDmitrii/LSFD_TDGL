@@ -56,7 +56,7 @@ def solve(device, operators, external_fields, options,
     Trackers are created automatically by TDGLRunner based on SolverOptions:
         - track_conservation=True  → ConservationTracker (energy, fluxes, residual)
         - track_physical=True      → PhysicalTracker (mu, phase at probe points)
-        - track_vortices=True      → VortexTracker (future)
+        - track_vortices=True      → VortexTracker (vortex x/y/vx/vy)  # !!!14.10_vortex!!!
 
     Args:
         device: Device geometry and mesh (mesh must be built before calling solve).
@@ -157,10 +157,7 @@ def _validate_configuration(device: Device, options: SolverOptions) -> None:
                 "or set options.track_physical=False."
             )
 
-    # VortexTracker validation (future)
-    # if options.track_vortices:
-    #     if options.max_vortices < 1:
-    #         raise ValueError(...)
+    # !!!14.10_vortex!!! VortexTracker scalar options are validated in SolverOptions.
 
 
 def _setup_logging(options: SolverOptions) -> None:

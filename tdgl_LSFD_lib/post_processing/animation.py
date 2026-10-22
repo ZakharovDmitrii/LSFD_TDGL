@@ -203,7 +203,7 @@ def make_video_from_solution(
 
     n_frames = len(steps)
     if n_frames < 2:
-        print(f"⚠️ Not enough frames for animation (n_frames={n_frames})")
+        print(f"Not enough frames for animation (n_frames={n_frames})")
         return None
 
     # Determine grid layout
@@ -299,7 +299,7 @@ def make_video_from_solution(
         return ims
 
     # Create animation
-    print(f"🎬 Creating animation ({n_frames} frames, {fps} fps, {n_quantities} panel(s))...")
+    print(f"Creating animation ({n_frames} frames, {fps} fps, {n_quantities} panel(s))...")
     anim = animation.FuncAnimation(
         fig, update, frames=n_frames, interval=1000 // fps, blit=True
     )
@@ -307,7 +307,7 @@ def make_video_from_solution(
     # Save as GIF
     anim.save(output_path, writer='pillow', fps=fps)
     plt.close(fig)
-    print(f"✅ Animation saved: {output_path}")
+    print(f"Animation saved: {output_path}")
     return output_path
 
 

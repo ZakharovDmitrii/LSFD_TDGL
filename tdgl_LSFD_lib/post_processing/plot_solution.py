@@ -429,7 +429,7 @@ def plot_summary(
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"✓ Saved to {save_path}")
+        print(f"Saved to {save_path}")
 
     return fig
 
@@ -574,7 +574,7 @@ def plot_conservation_summary(
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"✓ Saved to {save_path}")
+        print(f"Saved to {save_path}")
 
     return fig
 
@@ -686,6 +686,234 @@ def plot_probe_summary(
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"✓ Saved to {save_path}")
+        print(f"Saved to {save_path}")
 
+    return fig
+
+
+# ============================================================================
+# 10. PROBE DIFFERENCE SUMMARY
+# ============================================================================
+
+def plot_probe_difference_graph(
+        solution: Solution,
+        horizontal_pair: Tuple[int, int] = (0, 1),
+        vertical_pair: Tuple[int, int] = (2, 3),
+        figsize: Tuple[float, float] = (12, 10),
+        save_path: Optional[str] = None,
+):
+    """
+    Plot horizontal/vertical potential and phase differences from PhysicalTracker.
+
+    !!!14.10_vortex!!!
+    """
+    ts_keys = solution.list_time_series()
+    if 'mu_probe' not in ts_keys or 'phase_probe' not in ts_keys:
+        raise ValueError(
+            "PhysicalTracker data not found. "
+            "Check that device.probe_points is set and track_physical=True."
+        )
+
+    probe_data = solution.get_probe_data()
+    time = probe_data['time']
+    mu_probe = probe_data['mu_probe']
+    phase_probe = probe_data['phase_probe']
+    n_probes = mu_probe.shape[1]
+
+    for pair_name, pair in (("horizontal_pair", horizontal_pair), ("vertical_pair", vertical_pair)):
+        for idx in pair:
+            if idx < 0 or idx >= n_probes:
+                raise ValueError(f"{pair_name} index {idx} out of range [0, {n_probes - 1}]")
+
+    h0, h1 = horizontal_pair
+    v0, v1 = vertical_pair
+    delta_mu_h = mu_probe[:, h1] - mu_probe[:, h0]
+    delta_phase_h = phase_probe[:, h1] - phase_probe[:, h0]
+    delta_mu_v = mu_probe[:, v1] - mu_probe[:, v0]
+    delta_phase_v = phase_probe[:, v1] - phase_probe[:, v0]
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize, sharex=True)
+    series = [
+        (axes[0, 0], delta_mu_h, f'delta mu horizontal {horizontal_pair}', 'delta mu'),
+        (axes[0, 1], delta_phase_h, f'delta phase horizontal {horizontal_pair}', 'delta phase [pi]'),
+        (axes[1, 0], delta_mu_v, f'delta mu vertical {vertical_pair}', 'delta mu'),
+        (axes[1, 1], delta_phase_v, f'delta phase vertical {vertical_pair}', 'delta phase [pi]'),
+    ]
+
+    for ax, values, title, ylabel in series:
+        ax.plot(time, values, linewidth=1.5)
+        ax.set_title(title)
+        ax.set_xlabel('Time [tau0]')
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle('Probe Difference Summary', fontsize=14, fontweight='bold')
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {save_path}")
+
+    return fig
+
+
+# ============================================================================
+# 11. VORTEX TRACKER SUMMARY
+# ============================================================================
+
+def extract_vortex_trajectories(source):
+    """Return {ID: trajectory} from a Solution or get_vortex_data() result.
+
+    Dynamic trajectories contain only observed steps, with immutable charge,
+    birth and optional death. Legacy slot arrays retain NaN gaps; they cannot
+    provide reliable lifetime/identity information across slot reuse.
+    """
+    data = source.get_vortex_data() if isinstance(source, Solution) else source
+    trajectories = {}
+    if 'dyn_info' in data:
+        deaths = {int(row['vortex_id']): float(row['death']) for row in data['deaths']}
+        samples = data['dyn_info']
+        for row in data['stat_info']:
+            vortex_id = int(row['vortex_id'])
+            rows = samples[samples['vortex_id'] == vortex_id]
+            trajectories[vortex_id] = {
+                **{key: rows[key] for key in ('time', 'step', 'x', 'y', 'vx', 'vy', 'triangle_index')},
+                'charge': int(row['charge']), 'birth': float(row['birth']),
+                'death': deaths.get(vortex_id),
+            }
+    else:
+        for slot in range(data['x'].shape[1]):
+            if not np.any(np.isfinite(data['x'][:, slot]) & np.isfinite(data['y'][:, slot])):
+                continue
+            trajectories[slot] = {
+                'time': data['time'], 'step': np.arange(len(data['time'])),
+                **{key: data[key][:, slot] for key in ('x', 'y', 'vx', 'vy')},
+                'charge': None, 'birth': None, 'death': None,
+            }
+    return trajectories
+
+
+def get_vortex_summary(source):
+    """Final phase-zero centers, equal-weight COM, completed lifetimes and |v|.
+
+    Alive trajectories are right-censored: they do not enter mean(death-birth).
+    Speeds are hypot(vx, vy) over finite estimates across the whole run.
+    """
+    data = source.get_vortex_data() if isinstance(source, Solution) else source
+    trajectories = extract_vortex_trajectories(data)
+    final_positions = []
+    dynamic = 'dyn_info' in data
+    if len(data['time']):
+        if dynamic:
+            begin, end = data['frame_offsets'][-2:]
+            for row in data['dyn_info'][int(begin):int(end)]:
+                vortex_id = int(row['vortex_id'])
+                final_positions.append({'vortex_id': vortex_id,
+                                        'charge': trajectories[vortex_id]['charge'],
+                                        'x': float(row['x']), 'y': float(row['y'])})
+        else:
+            for vortex_id, trajectory in trajectories.items():
+                x, y = trajectory['x'][-1], trajectory['y'][-1]
+                if np.isfinite(x) and np.isfinite(y):
+                    final_positions.append({'vortex_id': vortex_id, 'charge': None,
+                                            'x': float(x), 'y': float(y)})
+    center = (np.mean([[row['x'], row['y']] for row in final_positions], axis=0).tolist()
+              if final_positions else None)
+    lifetimes = {vortex_id: trajectory['death']-trajectory['birth']
+                 for vortex_id, trajectory in trajectories.items()
+                 if trajectory['death'] is not None and trajectory['birth'] is not None}
+    extrema = {'min_speed': None, 'max_speed': None}
+    for vortex_id, trajectory in trajectories.items():
+        speed = np.hypot(trajectory['vx'], trajectory['vy'])
+        finite = np.flatnonzero(np.isfinite(speed))
+        if not len(finite):
+            continue
+        for key, choose in (('min_speed', np.argmin), ('max_speed', np.argmax)):
+            i = int(finite[choose(speed[finite])])
+            candidate = {'value': float(speed[i]), 'vortex_id': vortex_id,
+                         'time': float(trajectory['time'][i]), 'step': int(trajectory['step'][i])}
+            previous = extrema[key]
+            if previous is None or ((candidate['value'] < previous['value']) if key == 'min_speed'
+                                    else (candidate['value'] > previous['value'])):
+                extrema[key] = candidate
+    return {
+        'final_time': float(data['time'][-1]) if len(data['time']) else None,
+        'final_positions': final_positions, 'center_of_mass': center,
+        'mean_lifetime': float(np.mean(list(lifetimes.values()))) if lifetimes else None,
+        'lifetimes': lifetimes, 'completed_vortices': len(lifetimes),
+        'alive_vortices': len(final_positions),
+        'total_vortices': len(data['stat_info']) if dynamic else None,
+        'legacy_slots_with_data': len(trajectories) if not dynamic else None,
+        **extrema,
+    }
+
+
+def print_vortex_summary(summary):
+    """Print a compact summary; missing physical statistics are not replaced by zero."""
+    print(f"Последний шаг: t={summary['final_time']}; центры вихрей (phase_zero), xi:")
+    for row in summary['final_positions']:
+        print(f"  ID {row['vortex_id']}: x={row['x']:.6g}, y={row['y']:.6g}")
+    if not summary['final_positions']:
+        print("  вихрей нет")
+    center = summary['center_of_mass']
+    print(f"Центр масс (равные веса): {tuple(center) if center is not None else 'не определён'}")
+    if summary['mean_lifetime'] is None:
+        print("Среднее время жизни: нет завершённых траекторий с данными birth/death")
+    else:
+        print(f"Среднее время жизни: {summary['mean_lifetime']:.6g} "
+              f"(завершённых: {summary['completed_vortices']}; живых в конце: {summary['alive_vortices']})")
+    for key, label in (('min_speed', 'Минимальная скорость'), ('max_speed', 'Максимальная скорость')):
+        item = summary[key]
+        print(f"{label}: " + (f"{item['value']:.6g} xi/tau0, ID {item['vortex_id']}, t={item['time']:.6g}"
+                                  if item is not None else "нет конечных оценок"))
+    total = summary['total_vortices']
+    print(f"Всего вихрей за моделирование: {total if total is not None else 'недоступно в старом формате слотов'}")
+
+
+def plot_vortex_tracker_graph(
+        solution: Solution,
+        vortex_indices: Optional[List[int]] = None,
+        figsize: Tuple[float, float] = (12, 10),
+        save_path: Optional[str] = None,
+        *,
+        vortex_ids: Optional[List[int]] = None,
+        print_summary: bool = True,
+        velocity_ylim: Optional[Tuple[float, float]] = None,
+):
+    """Plot x(t), y(t), vx(t), vy(t) for every observed ID, including ended IDs.
+
+    vortex_indices remains a compatibility alias for vortex_ids. By default all
+    trajectories are shown. The printed summary always covers the full run.
+    Legacy fixed-slot HDF5 remains readable and plottable.
+    """
+    data = solution.get_vortex_data()
+    trajectories = extract_vortex_trajectories(data)
+    if vortex_ids is not None and vortex_indices is not None:
+        raise ValueError("Specify vortex_ids or vortex_indices, not both")
+    selected = vortex_ids if vortex_ids is not None else vortex_indices
+    selected = list(trajectories) if selected is None else list(selected)
+    missing = set(selected)-trajectories.keys()
+    if missing:
+        raise ValueError(f"Unknown vortex IDs: {sorted(missing)}")
+    fig, axes = plt.subplots(2, 2, figsize=figsize, sharex=True)
+    for ax, key, label in zip(axes.flat, ('x', 'y', 'vx', 'vy'),
+                             ('x [xi]', 'y [xi]', 'vx [xi/tau0]', 'vy [xi/tau0]')):
+        for order, vortex_id in enumerate(selected):
+            trajectory = trajectories[vortex_id]
+            ax.plot(trajectory['time'], trajectory[key], color=f'C{order % 10}',
+                    linewidth=1.3, marker='.', markersize=2, label=f'ID {vortex_id}')
+        ax.set(title=f'{key}(t)', xlabel='Time [tau0]', ylabel=label)
+        ax.grid(True, alpha=0.3)
+        if selected:
+            ax.legend(fontsize=8)
+
+    if velocity_ylim is not None:
+        axes[1, 0].set_ylim(*velocity_ylim)
+        axes[1, 1].set_ylim(*velocity_ylim)
+    fig.suptitle('VortexTracker trajectories', fontsize=14)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    if print_summary:
+        print_vortex_summary(get_vortex_summary(data))
     return fig

@@ -18,6 +18,12 @@ Tracker interface:
     A tracker must implement exactly two methods:
         1. on_step()    — compute scalars from current StepResult and store in buffer
         2. flush_to_hdf5() — write filled buffer to HDF5 file
+
+Dynamic trackers may buffer variable-length arrays for each step and append
+structured HDF5 tables instead of rectangular time-by-slot datasets. Their
+_idx still counts buffered steps. An optional flush_requested flag requests an
+early, synchronized flush of Runner's clock and all trackers after a step.
+Velocity/matching history must survive ordinary flushes.
 """
 
 from abc import ABC, abstractmethod
