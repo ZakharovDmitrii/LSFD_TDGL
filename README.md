@@ -14,8 +14,8 @@
 **TDGL LSFD Solver** is a Python library for simulating the dynamics of superconducting thin films within the time-dependent Ginzburg–Landau (TDGL) framework. Spatial derivatives are computed with the **Least-Squares Finite Difference (LSFD)** method on unstructured triangular meshes, which enables arbitrary 2D geometries and high-order accuracy. Linear and cubic **spin–orbit coupling (SOC)** terms are built in, opening the door to modeling the **superconducting diode effect (SDE)** and other non-reciprocal superconducting phenomena. First physical results for equilibrium single vortex configuration was published in article: https://doi.org/10.1103/3nnt-b8xv
 
 <p align="center">
-  <img src="images/four_vortex.png" width="40%" alt="Vortices on radial film">
-  <img src="images/shifted_vortex.png" width="40%" alt="Vortices on radial film, gamma = 0.1">
+  <img src="images/four_vortex.png" width="35%" alt="Vortices on radial film">
+  <img src="images/shifted_vortex.png" width="35%" alt="Vortices on radial film, gamma = 0.1">
 </p>
 <p align="center"><i>Left: vortices on radial film — |ψ|, phase, μ, supercurrent, normal current, div(Js). Right: supercurrent distribution for γ = 0.1.</i></p>
 
