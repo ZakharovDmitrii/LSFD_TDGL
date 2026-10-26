@@ -27,6 +27,7 @@
 - **Ferromagnetic coupling** — spin–orbit coupling linear term with coefficient $\eta$ and cubic term with coefficient $\gamma$ with an arbitrary polarization direction $\mathbf{s}$.
 - **Adaptive dynamics** — adaptive time stepping and adaptive tolerance for the Poisson solver for the scalar potential $\mu$.
 - **Conservation checks** — a finite-volume (FVM) integrator to verify the divergence theorem and local/global current conservation.
+- **Vortex tracking** — detection of vortex positions via topological charge calculation and estimation of vortex velocities using second-order least-squares polynomial fitting at each time step.
 - **HDF5 I/O** — checkpoints with the ability to resume a simulation.
 - **Visualization** — devices, meshes, Voronoi diagrams, fields and animations.
 
@@ -56,7 +57,8 @@ LSFD_TDGL/
 │   ├── operators/         # LSFD operators, FVM integrator, numba kernels
 │   ├── external_fields/   # External fields: B, J, ferromagnet (eta, gamma, s)
 │   ├── solver/            # TDGL solver, runner, adaptive options
-│   └── post_processing/   # HDF5 loading, analysis and animations
+│   ├── post_processing/   # HDF5 loading, analysis and animations
+│   └── trackers/          # Per-step monitoring of voltage, phase, vortex dynamics, and conservation laws
 ├── examples/              # Runnable examples
 ├── docs/images/           # Images for this README
 ├── pyproject.toml
@@ -108,4 +110,4 @@ If you use this library in your research, please cite both the paper in which th
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.й
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
